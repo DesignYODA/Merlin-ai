@@ -1,0 +1,17 @@
+const FIREFLIES_API_URL = process.env.FIREFLIES_API_URL;
+const FIREFLIES_FROM_DATE = process.env.FIREFLIES_FROM_DATE;
+const HUBSPOT_API_BASE = process.env.HUBSPOT_API_BASE;
+const FIREFLIES_API_KEY = process.env.FIREFLIES_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
+const PORT = Number(process.env.PORT || 3001);
+
+export {
+    FIREFLIES_API_URL,
+    FIREFLIES_FROM_DATE,
+    HUBSPOT_API_BASE,
+    FIREFLIES_API_KEY,
+    GROQ_API_KEY,
+    HUBSPOT_API_KEY,
+    PORT
+}
