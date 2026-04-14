@@ -21,30 +21,20 @@ import {
   HUBSPOT_API_BASE,
   FIREFLIES_API_KEY,
   GROQ_API_KEY,
-  HUBSPOT_API_KEY
+  HUBSPOT_API_KEY,
+  REDACTED_NAMES,
+  EXCLUDED_HOSTS,
+  EXCLUDED_TITLES,
+  INTERNAL_DOMAINS,
+  HIRING_KEYWORDS,
 } from "./config.mjs";
 
-const REDACTED_NAMES = [
-  "Mayank kukureja",
-  "Mayank Kukureja",
-  "mayank kukureja",
-  "Vishal jetley",
-  "Vishal Jetley",
-  "vishal jetley",
-  "Anish Khadiya",
-  "Anish khadiya",
-  "anish khadiya",
-];
-
-const REDACT_REGEX = new RegExp(
-  REDACTED_NAMES.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
-  "gi",
-);
-
-const EXCLUDED_HOSTS = ["vishal jetley", "anish khadiya"];
-const EXCLUDED_TITLES = ["weekly sales huddle"];
-const INTERNAL_DOMAINS = ["itilite.com", "fireflies.ai"];
-const HIRING_KEYWORDS = ["round", "interview", "candidate", "hiring"];
+const REDACT_REGEX = REDACTED_NAMES.length
+  ? new RegExp(
+      REDACTED_NAMES.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+      "gi",
+    )
+  : null;
 
 // =========================
 // Helpers (exported for app.mjs)
@@ -235,6 +225,7 @@ function redactString(val) {
       return "";
     }
   }
+  if (!REDACT_REGEX) return val;
   REDACT_REGEX.lastIndex = 0;
   return val.replace(REDACT_REGEX, "[Redacted]");
 }
@@ -248,6 +239,7 @@ function safeToArray(val) {
 
 function redactArray(val) {
   const arr = safeToArray(val);
+  if (!REDACT_REGEX) return arr.filter((s) => s !== null && s !== undefined).map((s) => redactString(s));
   return arr
     .filter((s) => {
       if (s === null || s === undefined) return false;
@@ -283,6 +275,7 @@ export function redactTranscript(t) {
       redacted.sentences = t.sentences
         .filter((s) => {
           if (!s) return false;
+          if (!REDACT_REGEX) return true;
           REDACT_REGEX.lastIndex = 0;
           return !REDACT_REGEX.test(s.speaker_name || "");
         })

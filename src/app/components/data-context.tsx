@@ -297,6 +297,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [dbCallCount, setDbCallCount] = useState(0);
   const syncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const incrementalSyncRef = useRef<() => void>(() => {});
 
   // Load calls + HubSpot data in parallel from /data
   const loadFromDb = useCallback(async () => {
@@ -418,17 +419,22 @@ export function DataProvider({ children }: { children: ReactNode }) {
     initialLoad();
   }, [initialLoad]);
 
-  // Auto-sync interval (every 5 minutes for new calls)
+  // Keep the ref in sync with the latest incrementalSync without restarting the interval
+  useEffect(() => {
+    incrementalSyncRef.current = incrementalSync;
+  }, [incrementalSync]);
+
+  // Auto-sync interval (every 5 minutes for new calls) — set up once on mount
   useEffect(() => {
     syncIntervalRef.current = setInterval(() => {
       console.log("Auto-sync: checking for new calls...");
-      incrementalSync();
+      incrementalSyncRef.current();
     }, 5 * 60 * 1000);
 
     return () => {
       if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     };
-  }, [incrementalSync]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Get call detail with sentences
   const getCallDetail = useCallback(

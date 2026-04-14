@@ -202,3 +202,7 @@ export function deleteMeetings(ids) {
   const placeholders = ids.map(() => "?").join(",");
   db.prepare(`DELETE FROM meetings WHERE id IN (${placeholders})`).run(...ids);
 }
+
+export function closeDb() {
+  db.close();
+}
