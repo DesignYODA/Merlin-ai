@@ -4,6 +4,7 @@ import {
   kvGet,
   kvSet,
   kvDel,
+  closeDb,
   // getStoredApiKey,
   shouldAnalyzeMeeting,
   classifyMeetingType,
@@ -672,6 +673,17 @@ app.post("/rewrite-query", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[sqlite-api] listening on http://localhost:${PORT}`);
 });
+
+function shutdown(signal) {
+  console.log(`[server] ${signal} received — closing DB and exiting`);
+  server.close(() => {
+    closeDb();
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
