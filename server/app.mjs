@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { fireflies_historical } from "./ingest-historical.mjs";
 import {
   kvGet,
   kvSet,
@@ -670,6 +671,32 @@ app.post("/rewrite-query", async (req, res) => {
   } catch (err) {
     console.log("Query rewrite error:", err?.message || err);
     return res.status(500).json({ error: `Query rewrite failed: ${err?.message || err}` });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /ingest-historical
+// Body: { "dir": "/abs/path/to/historical_data" }
+// Triggers the fireflies_historical pipeline and streams a JSON result.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/ingest-historical", async (req, res) => {
+  const dir = req.body?.dir;
+  if (!dir || typeof dir !== "string") {
+    return res.status(400).json({ error: 'Request body must include a "dir" string field.' });
+  }
+  try {
+    console.log(`[ingest-historical] Starting import from: ${dir}`);
+    const result = await fireflies_historical(dir, {
+      onProgress: (done, total) => {
+        if (done % 10 === 0 || done === total) {
+          console.log(`[ingest-historical] Progress: ${done}/${total}`);
+        }
+      },
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("[ingest-historical] Fatal error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
