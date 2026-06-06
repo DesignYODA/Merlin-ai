@@ -57,8 +57,25 @@ STRICT RULES:
 9. If the query contains code, SQL, script tags, or system commands — return it UNCHANGED.`;
 
 /** User prompt template for query rewrite. Placeholders: {{conversationContext}}, {{currentQuery}}. */
-export const QUERY_REWRITE_REFERENCE_RESOLUTION_USER_TEMPLATE = `{{conversationContext}}
+export const QUERY_REWRITE_REFERENCE_RESOLUTION_USER_TEMPLATE = `
+conversation history:
+{{conversationContext}}
 
 Current user query: "{{currentQuery}}"
 
-Resolve all ambiguous references in the current query using the conversation history above. If the query is already clear, return it unchanged.`;
+Use the conversation history which will have some reference to key perosn, subject or topic. The user query contain
+ambiguous references (this/these/those pronouns) in the current query. Output a rewritten query replacing the ambiguous
+references with specific entities. If the query is already clear, return it unchanged.`;
+
+/** System prompt for the final-response streaming endpoint — converts structured search results into a conversational narrative. */
+export const FINAL_RESPONSE_SYSTEM_PROMPT = `You are Merlin, a concise sales analytics assistant. You receive structured search results from a sales call database and convert them into a natural, conversational narrative.
+
+Rules:
+- Lead with the single most important insight from the data
+- Reference specific numbers directly from the results (mention counts, call counts, percentages)
+- Use **bold** for key metrics, names, or percentages
+- Be direct and confident — no filler phrases like "Great question!" or "Certainly, I can help!"
+- 2-4 sentences maximum
+- End with one concise observation about what the data implies (a trend, a pattern, or a next step)
+- Do NOT fabricate any data not present in the results
+- If no results were found, briefly acknowledge it and suggest trying different keywords`;

@@ -20,6 +20,7 @@ import {
   deepTranscriptSearch,
   generateResultSummary,
   formatResponse,
+  streamFinalResponse,
   generateFollowUpSuggestions,
   renderMarkdownSafe,
   suggestedQueries,
@@ -52,6 +53,59 @@ export function AskAiPage() {
   const [searchStatus, setSearchStatus] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const memoryRef = useRef<ConversationMemory>({ ...EMPTY_MEMORY });
+  const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
+
+  const toggleEvidence = (msgId: string) => {
+    setExpandedEvidence((prev) => {
+      const next = new Set(prev);
+      next.has(msgId) ? next.delete(msgId) : next.add(msgId);
+      return next;
+    });
+  };
+
+  function evidenceSummary(data: ResultData): string {
+    if (data.totalMentions !== undefined)
+      return `${data.totalMentions} mention${data.totalMentions !== 1 ? "s" : ""} · ${data.totalMeetings ?? 0} call${(data.totalMeetings ?? 0) !== 1 ? "s" : ""}`;
+    if (data.topicRankings?.length) return `${data.topicRankings.length} topics`;
+    if (data.participantRankings?.length) return `${data.participantRankings.length} participants`;
+    if (data.actionItems?.length) return `${data.actionItems.length} action item${data.actionItems.length !== 1 ? "s" : ""}`;
+    if (data.sentiment) return `${data.sentiment.positive + data.sentiment.neutral + data.sentiment.negative} calls`;
+    if (data.durationList?.length) return `${data.durationList.length} calls`;
+    if (data.competitorMentions?.length) return `${data.competitorMentions.length} competitor${data.competitorMentions.length !== 1 ? "s" : ""}`;
+    if (data.overviewStats) return `${data.overviewStats.totalCalls} calls`;
+    return "results";
+  }
+
+  // ─── Streaming greeting animation ───
+  const GREETING_DESC =
+    "Your sales companion to easy understanding of our calls. Ask me anything about your meetings — I'll dig through transcripts, surface patterns, and give you evidence-backed insights.";
+  const [streamedDesc, setStreamedDesc] = useState("");
+  const [streamingDone, setStreamingDone] = useState(false);
+  const [visibleSuggestions, setVisibleSuggestions] = useState(0);
+
+  useEffect(() => {
+    let i = 0;
+    const iv = setInterval(() => {
+      i++;
+      setStreamedDesc(GREETING_DESC.slice(0, i));
+      if (i >= GREETING_DESC.length) {
+        clearInterval(iv);
+        setStreamingDone(true);
+      }
+    }, 16);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    if (!streamingDone) return;
+    let n = 0;
+    const iv = setInterval(() => {
+      n++;
+      setVisibleSuggestions(n);
+      if (n >= suggestedQueries.length) clearInterval(iv);
+    }, 65);
+    return () => clearInterval(iv);
+  }, [streamingDone]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -281,7 +335,7 @@ export function AskAiPage() {
         )
       );
 
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 400));
 
       // Apply call count limit if specified (e.g., "last 5 calls")
       let searchCalls = calls;
@@ -356,19 +410,17 @@ export function AskAiPage() {
         }
       }
 
-      // Generate the 2-3 line summary + the detailed section header
-      const summary = generateResultSummary(result, parsed);
+      // Generate the detail section header (used as LLM context + fallback)
       const detailHeader = formatResponse(result, parsed);
-      const responseContent = `${summary}\n\n${detailHeader}`;
 
       // ─── STEP 5: Update conversation memory ───
-      const responseSummaryForMemory = generateResultSummary(result, parsed).slice(0, 300);
+      const responseSummaryForMemory = generateResultSummary(result, parsed).slice(0, 400);
       memoryRef.current = {
         lastQueryTopic: parsed.entities.join(" ") || memory.lastQueryTopic,
         lastParsedQuery: parsed,
         lastResultData: result,
         lastRetrievedCallIds: result.mentions?.map((m) => m.callId) || memory.lastRetrievedCallIds,
-        lastAnswer: responseContent,
+        lastAnswer: detailHeader,
         turnCount: memory.turnCount + 1,
         previousRawQueries: [query, ...memory.previousRawQueries].slice(0, 5),
         previousResponseSummaries: [responseSummaryForMemory, ...memory.previousResponseSummaries].slice(0, 5),
@@ -378,15 +430,18 @@ export function AskAiPage() {
       const resolvedScope = parsed.timeFilter?.label
         || (callLimit ? `last ${callLimit} calls` : `${result.searchedCallCount} calls`);
 
+      // Create the message immediately with empty content — LLM streams into it
+      const finalMsgId = `response-${Date.now()}`;
       setMessages((prev) =>
         prev.map((m) =>
           m.id === searchingId
             ? {
-                id: `response-${Date.now()}`,
+                id: finalMsgId,
                 role: "assistant" as const,
-                content: responseContent,
+                content: "",
                 timestamp: new Date().toISOString(),
                 isSearching: false,
+                isStreaming: true,
                 resultData: result,
                 parsedQuery: parsed,
                 plannerIntent,
@@ -398,6 +453,28 @@ export function AskAiPage() {
             : m
         )
       );
+
+      // Stream LLM narrative token-by-token into the message
+      try {
+        await streamFinalResponse(result, parsed, detailHeader, (token) => {
+          setMessages((prev) =>
+            prev.map((m) => m.id === finalMsgId ? { ...m, content: m.content + token } : m)
+          );
+        });
+      } catch {
+        // Streaming failed — use static fallback only if content is still empty
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === finalMsgId && m.content === ""
+              ? { ...m, content: `${responseSummaryForMemory}\n\n${detailHeader}` }
+              : m
+          )
+        );
+      } finally {
+        setMessages((prev) =>
+          prev.map((m) => m.id === finalMsgId ? { ...m, isStreaming: false } : m)
+        );
+      }
     } catch (err) {
       console.error("Ask Merlin search error:", err);
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -504,34 +581,39 @@ export function AskAiPage() {
                 <p className="text-white mb-1" style={{ fontSize: "1.1rem", fontWeight: 600 }}>
                   Hi, I'm Merlin
                 </p>
-                <p className="text-[#c0c0d0]" style={{ fontSize: "0.88rem", lineHeight: "1.6" }}>
-                  Your sales companion to easy understanding of our calls. Ask me anything about your meetings — I'll dig through transcripts, surface patterns, and give you evidence-backed insights.
+                <p className="text-[#c0c0d0]" style={{ fontSize: "0.88rem", lineHeight: "1.6", minHeight: "3.2rem" }}>
+                  {streamedDesc}
+                  {!streamingDone && (
+                    <span className="inline-block w-0.5 h-3.5 bg-[#ec5d25] ml-0.5 align-middle animate-pulse" />
+                  )}
                 </p>
-                {isLive && (
+                {streamingDone && isLive && (
                   <p className="text-[#8888a0] mt-2" style={{ fontSize: "0.75rem" }}>
                     Currently indexing <span className="text-[#ec5d25]">{totalCallsFetched} calls</span> — ready to explore.
                   </p>
                 )}
-                {fetchProgress && <p className="text-[#ec5d25] mt-1" style={{ fontSize: "0.72rem" }}>{fetchProgress}</p>}
+                {streamingDone && fetchProgress && <p className="text-[#ec5d25] mt-1" style={{ fontSize: "0.72rem" }}>{fetchProgress}</p>}
               </div>
             </div>
 
-            {/* Suggested queries */}
-            <div className="mb-4">
-              <p className="text-[#555568] mb-3" style={{ fontSize: "0.72rem", fontWeight: 500 }}>Try asking me:</p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 w-full">
-                {suggestedQueries.map((q) => (
-                  <button
-                    key={q}
-                    onClick={() => setInput(q)}
-                    className="text-left p-3 rounded-xl bg-[#12121c] border border-[#1e1e2e] text-[#c0c0d0] hover:border-[#ec5d25]/50 hover:text-white transition-all cursor-pointer"
-                    style={{ fontSize: "0.78rem" }}
-                  >
-                    "{q}"
-                  </button>
-                ))}
+            {/* Suggested queries — progressive reveal after streaming */}
+            {streamingDone && (
+              <div className="mb-4">
+                <p className="text-[#555568] mb-3" style={{ fontSize: "0.72rem", fontWeight: 500 }}>Try asking me:</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 w-full">
+                  {suggestedQueries.slice(0, visibleSuggestions).map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => setInput(q)}
+                      className="text-left p-3 rounded-xl bg-[#12121c] border border-[#1e1e2e] text-[#c0c0d0] hover:border-[#ec5d25]/50 hover:text-white transition-all cursor-pointer"
+                      style={{ fontSize: "0.78rem", animation: "fadeSlideIn 0.25s ease-out both" }}
+                    >
+                      "{q}"
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         ) : (
           <div className="max-w-4xl mx-auto space-y-6">
@@ -569,33 +651,56 @@ export function AskAiPage() {
                       <p
                         className={msg.role === "user" ? "text-white" : "text-[#e0e0ee]"}
                         style={{ fontSize: "0.85rem" }}
-                        dangerouslySetInnerHTML={{
-                          __html: renderMarkdownSafe(msg.content),
-                        }}
-                      />
+                      >
+                        <span dangerouslySetInnerHTML={{ __html: renderMarkdownSafe(msg.content) }} />
+                        {msg.isStreaming && (
+                          <span className="inline-block w-0.5 h-3.5 bg-[#ec5d25] ml-0.5 align-middle animate-pulse" />
+                        )}
+                      </p>
 
                       {msg.resultData && !msg.resultData.noResults && (
-                        <div className="space-y-3">
-                          <ResultRenderer data={msg.resultData} />
+                        <div className="space-y-2">
+                          {/* Evidence toggle button */}
+                          <button
+                            onClick={() => toggleEvidence(msg.id)}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1a1a28] border border-[#2a2a3e] text-[#8888a0] hover:border-[#ec5d25]/40 hover:text-[#c0c0d0] transition-all"
+                            style={{ fontSize: "0.72rem" }}
+                          >
+                            {expandedEvidence.has(msg.id)
+                              ? <><ChevronUp className="w-3.5 h-3.5" /> Hide Evidence</>
+                              : <><ChevronDown className="w-3.5 h-3.5" /> Show Evidence</>}
+                            {!expandedEvidence.has(msg.id) && (
+                              <span className="ml-1 px-1.5 py-0.5 rounded bg-[#ec5d25]/15 text-[#f5a07a] border border-[#ec5d25]/20" style={{ fontSize: "0.62rem", fontWeight: 600 }}>
+                                {evidenceSummary(msg.resultData)}
+                              </span>
+                            )}
+                          </button>
 
-                          {/* Grounding + actions */}
-                          <div className="flex items-center justify-between pt-1">
-                            <div className="flex items-center gap-2 text-emerald-400" style={{ fontSize: "0.65rem" }}>
-                              <Search className="w-3 h-3" />
-                              <span>Every claim backed by transcript evidence</span>
-                            </div>
-                            <div className="flex gap-2">
-                              <button onClick={() => handleCopy(JSON.stringify(msg.resultData, null, 2))} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#1e1e2e] text-[#8888a0] hover:text-white transition-colors" style={{ fontSize: "0.68rem" }}>
-                                <Copy className="w-3 h-3" /> Copy
-                              </button>
-                              <button onClick={() => handleExportCSV(msg.resultData!)} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#1e1e2e] text-[#8888a0] hover:text-white transition-colors" style={{ fontSize: "0.68rem" }}>
-                                <Download className="w-3 h-3" /> CSV
-                              </button>
-                            </div>
-                          </div>
+                          {/* Collapsible evidence panel */}
+                          {expandedEvidence.has(msg.id) && (
+                            <div className="space-y-3 pt-1">
+                              <ResultRenderer data={msg.resultData} />
 
-                          {/* Follow-up suggestions */}
-                          {msg.parsedQuery && msg.resultData && !msg.resultData.noResults && (
+                              {/* Grounding + actions */}
+                              <div className="flex items-center justify-between pt-1">
+                                <div className="flex items-center gap-2 text-emerald-400" style={{ fontSize: "0.65rem" }}>
+                                  <Search className="w-3 h-3" />
+                                  <span>Every claim backed by transcript evidence</span>
+                                </div>
+                                <div className="flex gap-2">
+                                  <button onClick={() => handleCopy(JSON.stringify(msg.resultData, null, 2))} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#1e1e2e] text-[#8888a0] hover:text-white transition-colors" style={{ fontSize: "0.68rem" }}>
+                                    <Copy className="w-3 h-3" /> Copy
+                                  </button>
+                                  <button onClick={() => handleExportCSV(msg.resultData!)} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#1e1e2e] text-[#8888a0] hover:text-white transition-colors" style={{ fontSize: "0.68rem" }}>
+                                    <Download className="w-3 h-3" /> CSV
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Follow-up suggestions always visible */}
+                          {msg.parsedQuery && (
                             <FollowUpSuggestions
                               suggestions={generateFollowUpSuggestions(msg.resultData, msg.parsedQuery)}
                               onSelect={(q) => { setInput(q); }}

@@ -5,11 +5,15 @@ import {
   kvMdel,
   kvGetByPrefix,
   kvMset,
+  closeDb,
   // getStoredApiKey,
   getAllMeetings,
   getMeetingById,
   upsertMeetings,
   deleteMeetings,
+  upsertProductInsights,
+  getAllProductInsights,
+  deleteProductInsights,
 } from "./sqlite-api.mjs";
 import {
   PRODUCT_MENTIONS_EXTRACTION_SYSTEM_PROMPT,
@@ -21,6 +25,7 @@ import {
   HUBSPOT_API_BASE,
   FIREFLIES_API_KEY,
   GROQ_API_KEY,
+  ANTHROPIC_API_KEY,
   HUBSPOT_API_KEY,
   REDACTED_NAMES,
   EXCLUDED_HOSTS,
@@ -47,15 +52,34 @@ export {
   kvMdel,
   kvGetByPrefix,
   kvMset,
+  closeDb,
   getAllMeetings,
   getMeetingById,
   upsertMeetings,
   deleteMeetings,
+  upsertProductInsights,
+  getAllProductInsights,
+  deleteProductInsights,
 };
 
-export async function hubspotRequest(path, options = {}) {
+// ─── HubSpot rate limiter: 5 requests/second (sliding window) ────────────────
+const _hsTimestamps = [];
+async function _hsThrottle() {
+  const now = Date.now();
+  while (_hsTimestamps.length > 0 && now - _hsTimestamps[0] >= 1000) _hsTimestamps.shift();
+  if (_hsTimestamps.length >= 5) {
+    const waitMs = 1000 - (now - _hsTimestamps[0]) + 1;
+    await new Promise((r) => setTimeout(r, waitMs));
+    return _hsThrottle();
+  }
+  _hsTimestamps.push(Date.now());
+}
+
+export async function hubspotRequest(path, options = {}, _retries = 3) {
   const apiKey = HUBSPOT_API_KEY;
   if (!apiKey) throw new Error("HUBSPOT_API_KEY not configured");
+
+  await _hsThrottle();
 
   const url = path.startsWith("http") ? path : `${HUBSPOT_API_BASE}${path}`;
   const res = await fetch(url, {
@@ -66,6 +90,15 @@ export async function hubspotRequest(path, options = {}) {
       ...(options.headers || {}),
     },
   });
+
+  if (res.status === 429) {
+    if (_retries <= 0) throw new Error("HubSpot rate limit exceeded after retries");
+    const retryAfter = res.headers.get("Retry-After");
+    const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000;
+    console.log(`[hubspot] Rate limited — waiting ${waitMs}ms before retry (${_retries} left)`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    return hubspotRequest(path, options, _retries - 1);
+  }
 
   if (!res.ok) {
     const text = await res.text();
@@ -439,9 +472,84 @@ export function buildTranscript(call) {
   return parts.join("\n\n");
 }
 
-export async function extractProductMentionsViaGroq(call, transcriptText) {
-  const groqApiKey = GROQ_API_KEY;
-  if (!groqApiKey) return [];
+// ─── Unified LLM caller ───────────────────────────────────────────────────────
+// Defaults to Anthropic when ANTHROPIC_API_KEY is set; falls back to Groq.
+export async function callLLM(systemPrompt, userContent, {
+  timeoutMs = 15000,
+  maxTokens = 800,
+  temperature = 0.2,
+} = {}) {
+  const anthropicKey = ANTHROPIC_API_KEY;
+  const groqKey = GROQ_API_KEY;
+
+  if (!anthropicKey && !groqKey) {
+    throw new Error("No LLM API key configured (set ANTHROPIC_API_KEY or GROQ_API_KEY)");
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    if (anthropicKey) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: maxTokens,
+          temperature,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userContent }],
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Anthropic API error: ${response.status} ${errText}`);
+      }
+
+      const data = await response.json();
+      return data.content?.[0]?.text?.trim() ?? "";
+    }
+
+    // Fallback: Groq
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${groqKey}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent },
+        ],
+        temperature,
+        max_tokens: maxTokens,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Groq API error: ${response.status} ${errText}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() ?? "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function extractProductMentions(call, transcriptText) {
+  if (!ANTHROPIC_API_KEY && !GROQ_API_KEY) return [];
 
   const clientName = (call.participants || []).find((p) => p !== call.organizer_email) || call.title?.split(" - ")[0] || "Unknown";
   const organizer = (call.organizer_email || "").split("@")[0]?.replace(/[._-]/g, " ") || "Unknown";
@@ -453,42 +561,19 @@ export async function extractProductMentionsViaGroq(call, transcriptText) {
     .replace("{{transcript}}", (transcriptText || "").slice(0, 6000));
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${groqApiKey}`,
-      },
-      body: JSON.stringify({
-        model: "llama-3.1-70b-versatile",
-        messages: [
-          { role: "system", content: PRODUCT_MENTIONS_EXTRACTION_SYSTEM_PROMPT },
-          { role: "user", content: userContent },
-        ],
-        temperature: 0.2,
-        max_tokens: 800,
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-
-    if (!response.ok) {
-      console.log(`[product-requests] Groq error ${response.status} for call ${call.id}`);
-      return [];
-    }
-
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content?.trim();
+    const raw = await callLLM(
+      PRODUCT_MENTIONS_EXTRACTION_SYSTEM_PROMPT,
+      userContent,
+      { timeoutMs: 15000, maxTokens: 800, temperature: 0.2 },
+    );
     if (!raw) return [];
 
     const cleaned = raw.replace(/^```json\s*|\s*```$/g, "").trim();
     const parsed = JSON.parse(cleaned);
     return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string" && x.trim()) : [];
   } catch (err) {
-    if (err.name === "AbortError") console.log(`[product-requests] Groq timeout for call ${call.id}`);
-    else console.log(`[product-requests] Groq parse/error for call ${call.id}:`, err?.message);
+    if (err.name === "AbortError") console.log(`[product-requests] LLM timeout for call ${call.id}`);
+    else console.log(`[product-requests] LLM parse/error for call ${call.id}:`, err?.message);
     return [];
   }
 }

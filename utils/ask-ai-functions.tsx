@@ -348,7 +348,10 @@ type QueryIntent =
   | "competitor"
   | "general_overview"
   | "summary"
-  | "text_search";
+  | "text_search"
+  | "problem_search"
+  | "problem_analysis"
+  | "history_search";
 
 // Query Planner intent types — classifies BEFORE retrieval
 type PlannerIntent =
@@ -358,7 +361,8 @@ type PlannerIntent =
   | "FOLLOW_UP"        // User is referring to a previous answer
   | "DRILL_DOWN"       // User wants deeper detail on previous results
   | "CORRECTION"      // User is questioning accuracy of previous answer
-  | "COMPETITION";    //  User wants analysis on competition
+  | "COMPETITION"    //  User wants analysis on competition
+  | "PROBLEM_SEARCH"    //  User wants to find problems
 
 // Conversation memory for follow-up context
 export interface ConversationMemory {
@@ -492,6 +496,7 @@ export interface ChatMessage {
   plannerScope?: string;
   rewrittenQuery?: string;
   wasRewritten?: boolean;
+  isStreaming?: boolean;
 }
 
 // =====================================================================
@@ -591,6 +596,12 @@ function detectIntent(q: string): QueryIntent {
     /(?:how\s+many|total)\s+(?:calls?|meetings?)/i.test(lower)
   ) {
     return "general_overview";
+  }
+  // Problem search
+  if (
+    /(?:problem|issues?|concerns?|problems?|issues?|challenges?|roadblocks?|blockers?|roadblocks?|blockers?)\s+(?:analysis|search|find|look|check|investigate|review|report|generate|create|generate)/i.test(lower)
+  ){
+    return "problem_search"
   }
 
   return "text_search";
@@ -991,6 +1002,35 @@ export function extractCallCountFilter(query: string): number | null {
 }
 
 // =====================================================================
+// Domain Keyword Mapping — maps user keywords to Itilite-specific context
+// =====================================================================
+const DOMAIN_KEYWORD_MAP: Record<string, { label: string; relatedTerms: string[] }> = {
+  "pricing": {
+    label: "Itilite Pricing",
+    relatedTerms: ["pricing", "price", "cost", "costs", "rates", "subscription", "billing", "plan", "plans", "fee", "fees", "quote", "contract", "package"],
+  },
+  "integrations": {
+    label: "Itilite Integrations",
+    relatedTerms: ["integration", "integrations", "integrate", "connector", "api", "hrms", "erp", "sap", "sync", "connect", "webhook", "plugin", "hris"],
+  },
+};
+
+function expandDomainEntities(entities: string[]): { expandedEntities: string[]; domainLabel: string | null } {
+  let expandedEntities = [...entities];
+  let domainLabel: string | null = null;
+
+  for (const [keyword, mapping] of Object.entries(DOMAIN_KEYWORD_MAP)) {
+    if (entities.some(e => e.toLowerCase() === keyword || e.toLowerCase().includes(keyword))) {
+      expandedEntities = [...new Set([...expandedEntities, ...mapping.relatedTerms])];
+      domainLabel = mapping.label;
+      break;
+    }
+  }
+
+  return { expandedEntities, domainLabel };
+}
+
+// =====================================================================
 // Search Engine — intent-aware
 // =====================================================================
 
@@ -1130,40 +1170,46 @@ export function executeSearch(calls: NormalizedCall[], parsed: ParsedQuery): Res
   if (parsed.timeFilter) {
     filtered = filterByTime(calls, parsed.timeFilter.days);
   }
+
+  const { expandedEntities, domainLabel } = expandDomainEntities(parsed.entities);
+  const enrichedParsed = expandedEntities.length !== parsed.entities.length
+    ? { ...parsed, entities: expandedEntities }
+    : parsed;
+
   const analystCategory = classifyAnalystCategory(parsed.rawQuery, parsed.intent);
   const base = {
     searchedCallCount: filtered.length,
-    queryEntity: parsed.entities.join(" "),
+    queryEntity: domainLabel ?? (parsed.entities.join(" ") || parsed.rawQuery),
     timeFilter: parsed.timeFilter?.label,
     analystCategory,
   };
 
   try {
-    switch (parsed.intent) {
+    switch (enrichedParsed.intent) {
       case "topic_ranking":
-        return searchTopicRanking(filtered, parsed, base);
+        return searchTopicRanking(filtered, enrichedParsed, base);
       case "topic_search":
       case "keyword_search":
-        return searchTopicOrKeyword(filtered, parsed, base);
+        return searchTopicOrKeyword(filtered, enrichedParsed, base);
       case "participant_query":
-        return searchParticipants(filtered, parsed, base);
+        return searchParticipants(filtered, enrichedParsed, base);
       case "action_items":
-        return searchActionItems(filtered, parsed, base);
+        return searchActionItems(filtered, enrichedParsed, base);
       case "sentiment":
-        return searchSentiment(filtered, parsed, base);
+        return searchSentiment(filtered, enrichedParsed, base);
       case "duration":
-        return searchDuration(filtered, parsed, base);
+        return searchDuration(filtered, enrichedParsed, base);
       case "competitor":
-        return searchCompetitor(filtered, parsed, base);
+        return searchCompetitor(filtered, enrichedParsed, base);
       case "general_overview":
-        return searchOverview(filtered, parsed, base);
+        return searchOverview(filtered, enrichedParsed, base);
       case "text_search":
       default:
-        return searchText(filtered, parsed, base);
+        return searchText(filtered, enrichedParsed, base);
     }
   } catch (err) {
     console.error("Search execution error:", err);
-    return { ...base, intent: parsed.intent, noResults: true };
+    return { ...base, intent: enrichedParsed.intent, noResults: true };
   }
 }
 
@@ -1637,19 +1683,23 @@ export async function deepTranscriptSearch(
 ): Promise<Map<string, TranscriptSnippet[]>> {
   const results = new Map<string, TranscriptSnippet[]>();
   const BATCH = 3;
+  const MAX_CALLS = 20;   // cap to avoid excessive fetches
+  const MAX_SNIPPETS = 8; // cap snippets per call to keep UI lean
 
-  for (let i = 0; i < matchedCallIds.length; i += BATCH) {
-    const batch = matchedCallIds.slice(i, i + BATCH);
-    if (onProgress) onProgress(`Deep searching transcripts ${i + 1}/${matchedCallIds.length}...`);
+  const ids = matchedCallIds.slice(0, MAX_CALLS);
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch = ids.slice(i, i + BATCH);
+    const processed = Math.min(i + BATCH, ids.length);
+    if (onProgress) onProgress(`Deep searching transcripts ${processed}/${ids.length}...`);
 
     const fetched = await Promise.all(
-      batch
-        .map((id) =>
-          fetch(`${SERVER_BASE}/calls/${id}`)
-            .then((r) => r.json())
-            .then((d) => d?.call ?? null)
-            .catch(() => null)
-        )
+      batch.map((id) =>
+        fetch(`${SERVER_BASE}/calls/${id}`)
+          .then((r) => r.json())
+          .then((d) => d?.call ?? null)
+          .catch(() => null)
+      )
     );
 
     for (const t of fetched) {
@@ -1657,10 +1707,12 @@ export async function deepTranscriptSearch(
       const snippets: TranscriptSnippet[] = [];
       for (const entity of entities) {
         for (const sentence of t.sentences) {
+          if (snippets.length >= MAX_SNIPPETS) break;
           if (sentence.text.toLowerCase().includes(entity.toLowerCase())) {
             snippets.push({ text: sentence.text, speakerName: sentence.speaker_name, matchHighlight: entity, startTime: sentence.start_time });
           }
         }
+        if (snippets.length >= MAX_SNIPPETS) break;
       }
       if (snippets.length > 0) results.set(t.id, snippets);
     }
@@ -1915,7 +1967,8 @@ function IntentBadge({ intent }: { intent: QueryIntent }) {
 function TopicRankingResult({ data }: { data: ResultData }) {
   const [expanded, setExpanded] = useState(false);
   const rankings = data.topicRankings || [];
-  const shown = expanded ? rankings : rankings.slice(0, 10);
+  const topTopics = data.topTopics || [];
+  const remaining = rankings.slice(5);
 
   return (
     <div className="space-y-3">
@@ -1924,9 +1977,9 @@ function TopicRankingResult({ data }: { data: ResultData }) {
         <AnalystCategoryBadge category={data.analystCategory} />
       </div>
       {/* Top 5 highlight cards */}
-      {data.topTopics && data.topTopics.length > 0 && (
+      {topTopics.length > 0 && (
         <div className="grid grid-cols-5 gap-2">
-          {data.topTopics.map((t, i) => (
+          {topTopics.map((t, i) => (
             <div key={t.topic} className="bg-[#12121c] border border-[#1e1e2e] rounded-lg p-3 text-center">
               <p className="text-[#ec5d25] mb-0.5" style={{ fontSize: "0.65rem", fontWeight: 600 }}>#{i + 1}</p>
               <p className="text-white truncate mb-1" style={{ fontSize: "0.8rem", fontWeight: 600 }} title={t.topic}>{t.topic}</p>
@@ -1938,45 +1991,26 @@ function TopicRankingResult({ data }: { data: ResultData }) {
           ))}
         </div>
       )}
-      {/* Full table */}
-      <div className="bg-[#12121c] border border-[#1e1e2e] rounded-xl overflow-hidden">
-        <table className="w-full">
-          <thead>
-            <tr className="border-b border-[#1e1e2e]">
-              <th className="px-4 py-2.5 text-left text-[#8888a0] w-8" style={{ fontSize: "0.7rem", fontWeight: 500 }}>#</th>
-              <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Topic / Keyword</th>
-              <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Mentions</th>
-              <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Calls</th>
-              <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Trend</th>
-              <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Recent Calls</th>
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((t, i) => (
-              <tr key={t.topic} className="border-b border-[#1e1e2e] last:border-b-0 hover:bg-[#1a1a28]">
-                <td className="px-4 py-2.5 text-[#555568]" style={{ fontSize: "0.75rem" }}>{i + 1}</td>
-                <td className="px-4 py-2.5" style={{ fontSize: "0.8rem" }}>
-                  <span className="text-white px-2 py-0.5 rounded bg-[#ec5d25]/10 border border-[#ec5d25]/20" style={{ fontSize: "0.75rem" }}>{t.topic}</span>
-                </td>
-                <td className="px-4 py-2.5 text-center text-[#f5a07a]" style={{ fontSize: "0.8rem", fontWeight: 600 }}>{t.count}</td>
-                <td className="px-4 py-2.5 text-center text-cyan-300" style={{ fontSize: "0.8rem" }}>{t.callCount}</td>
-                <td className="px-4 py-2.5 text-center">
-                  <span className={`${t.trend === "up" ? "text-emerald-400" : t.trend === "down" ? "text-red-400" : "text-[#8888a0]"}`} style={{ fontSize: "0.75rem" }}>
-                    {t.trend === "up" ? "↑ Up" : t.trend === "down" ? "↓ Down" : "—"}
-                  </span>
-                </td>
-                <td className="px-4 py-2.5 text-[#8888a0] max-w-[200px] truncate" style={{ fontSize: "0.7rem" }}>
-                  {t.recentCallTitles.join(", ")}
-                </td>
-              </tr>
+      {/* Remaining topics as pills */}
+      {remaining.length > 0 && (
+        <div className="bg-[#12121c] border border-[#1e1e2e] rounded-xl p-4">
+          <p className="text-[#555568] mb-3" style={{ fontSize: "0.68rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            {rankings.length} Topics Across {data.searchedCallCount} Calls
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(expanded ? remaining : remaining.slice(0, 24)).map((t) => (
+              <span key={t.topic} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#1a1a28] border border-[#2a2a3e] text-[#c0c0d0] hover:border-[#ec5d25]/30 hover:text-white transition-colors" style={{ fontSize: "0.72rem" }}>
+                {t.topic}
+                <span className="text-[#555568]" style={{ fontSize: "0.62rem" }}>{t.count}</span>
+              </span>
             ))}
-          </tbody>
-        </table>
-      </div>
-      {rankings.length > 10 && (
-        <button onClick={() => setExpanded(!expanded)} className="flex items-center gap-1 text-[#ec5d25] hover:text-[#f5a07a] transition-colors mx-auto" style={{ fontSize: "0.75rem" }}>
-          {expanded ? <><ChevronUp className="w-3 h-3" /> Show less</> : <><ChevronDown className="w-3 h-3" /> Show all {rankings.length} topics</>}
-        </button>
+          </div>
+          {remaining.length > 24 && (
+            <button onClick={() => setExpanded(!expanded)} className="flex items-center gap-1 text-[#ec5d25] hover:text-[#f5a07a] transition-colors mt-3" style={{ fontSize: "0.72rem" }}>
+              {expanded ? <><ChevronUp className="w-3 h-3" /> Show less</> : <><ChevronDown className="w-3 h-3" /> Show all {remaining.length} more topics</>}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
@@ -2006,30 +2040,36 @@ function RecordingLink({ url, compact = false }: { url?: string; compact?: boole
 
 function MentionsTable({ data }: { data: ResultData }) {
   const mentions = data.mentions || [];
-  const [viewMode, setViewMode] = useState<"table" | "evidence">(
-    data.analystCategory === "entity_extraction" || data.analystCategory === "specific_call" ? "evidence" : "table"
-  );
+  const [showAll, setShowAll] = useState(false);
+
+  // AE-level aggregation for summary
+  const aeMap = new Map<string, { count: number; callTitles: string[] }>();
+  for (const m of mentions) {
+    const ae = m.aeName || "Unknown";
+    const entry = aeMap.get(ae) || { count: 0, callTitles: [] };
+    entry.count += m.mentionCount;
+    if (entry.callTitles.length < 2 && !entry.callTitles.includes(m.callTitle)) entry.callTitles.push(m.callTitle);
+    aeMap.set(ae, entry);
+  }
+  const topAEs = [...aeMap.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 5);
+
+  // Best representative snippet per call, top 4 calls
+  type SnippetEntry = TranscriptSnippet & { callId: string; callTitle: string; date: string; recordingUrl?: string; mentionCount: number };
+  const topSnippets: SnippetEntry[] = mentions.slice(0, 4)
+    .map((m): SnippetEntry | null => {
+      const best = m.snippets.find(s => s.text && s.text.length > 20) || m.snippets[0];
+      return best ? { ...best, callId: m.callId, callTitle: m.callTitle, date: m.date, recordingUrl: m.recordingUrl, mentionCount: m.mentionCount } : null;
+    })
+    .filter((s): s is SnippetEntry => s !== null);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
         <IntentBadge intent={data.intent} />
         <AnalystCategoryBadge category={data.analystCategory} />
-        <div className="ml-auto flex items-center gap-1 bg-[#1e1e2e] rounded-lg p-0.5">
-          <button
-            onClick={() => setViewMode("table")}
-            className={`px-2.5 py-1 rounded-md transition-colors ${viewMode === "table" ? "bg-[#d44a1a] text-white" : "text-[#8888a0] hover:text-white"}`}
-            style={{ fontSize: "0.65rem" }}
-          >Table</button>
-          <button
-            onClick={() => setViewMode("evidence")}
-            className={`px-2.5 py-1 rounded-md transition-colors ${viewMode === "evidence" ? "bg-[#d44a1a] text-white" : "text-[#8888a0] hover:text-white"}`}
-            style={{ fontSize: "0.65rem" }}
-          >Evidence</button>
-        </div>
       </div>
 
-      {/* Quantitative summary cards */}
+      {/* Summary stats */}
       <div className="flex gap-3">
         <div className="bg-[#12121c] border border-[#1e1e2e] rounded-lg px-4 py-2.5">
           <p className="text-[#ec5d25]" style={{ fontSize: "1.15rem", fontWeight: 700 }}>{data.totalMentions}</p>
@@ -2045,139 +2085,108 @@ function MentionsTable({ data }: { data: ResultData }) {
         </div>
       </div>
 
-      {viewMode === "evidence" ? (
-        /* Evidence view — analyst-style entity list with transcript quotes */
-        <div className="space-y-3">
-          {mentions.map((m, i) => (
-            <div key={`${m.callId}-${i}`} className="bg-[#12121c] border border-[#1e1e2e] rounded-xl p-4 hover:border-[#ec5d25]/20 transition-colors">
+      {/* AE activity breakdown */}
+      {topAEs.length > 0 && (
+        <div className="bg-[#12121c] border border-[#1e1e2e] rounded-xl p-4">
+          <p className="text-[#555568] mb-3" style={{ fontSize: "0.68rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>Discussion by AE</p>
+          <div className="space-y-2.5">
+            {topAEs.map(([ae, { count, callTitles }]) => (
+              <div key={ae} className="flex items-center gap-3">
+                <div className="w-6 h-6 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shrink-0">
+                  <span className="text-white" style={{ fontSize: "0.55rem", fontWeight: 700 }}>{ae.charAt(0).toUpperCase()}</span>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[#c0c0d0] truncate" style={{ fontSize: "0.78rem" }}>{ae}</span>
+                    <span className="text-[#f5a07a] shrink-0" style={{ fontSize: "0.72rem", fontWeight: 600 }}>{count} mention{count !== 1 ? "s" : ""}</span>
+                  </div>
+                  <p className="text-[#555568] truncate" style={{ fontSize: "0.62rem" }}>{callTitles.join(", ")}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Key evidence quotes */}
+      {topSnippets.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-[#555568]" style={{ fontSize: "0.68rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>Key Evidence</p>
+          {topSnippets.map((snip, i) => (
+            <div key={i} className="bg-[#12121c] border border-[#1e1e2e] rounded-xl p-3.5 hover:border-[#ec5d25]/20 transition-colors">
               <div className="flex items-start justify-between mb-2">
                 <div>
-                  <p className="text-white" style={{ fontSize: "0.85rem", fontWeight: 600 }}>{m.callTitle}</p>
-                  <div className="flex items-center gap-3 mt-1">
-                    <span className="text-[#8888a0]" style={{ fontSize: "0.72rem" }}>AE: <span className="text-[#c0c0d0]">{m.aeName}</span></span>
-                    <span className="text-[#8888a0]" style={{ fontSize: "0.72rem" }}>Date: <span className="text-[#c0c0d0]">{m.date}</span></span>
-                    <span className={`px-2 py-0.5 rounded ${
-                      m.source === "transcript" ? "bg-emerald-500/15 text-emerald-300"
-                      : m.source === "summary" ? "bg-blue-500/15 text-blue-300"
-                      : "bg-amber-500/15 text-amber-300"
-                    }`} style={{ fontSize: "0.62rem" }}>{m.source}</span>
-                    <RecordingLink url={m.recordingUrl} />
+                  <p className="text-white" style={{ fontSize: "0.78rem", fontWeight: 600 }}>{snip.callTitle}</p>
+                  <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                    {snip.speakerName && <span className="text-[#f5a07a]" style={{ fontSize: "0.65rem", fontWeight: 600 }}>{snip.speakerName}</span>}
+                    <span className="text-[#555568]" style={{ fontSize: "0.65rem" }}>{snip.date}</span>
+                    {snip.startTime !== undefined && snip.startTime >= 0 && (() => {
+                      const tsUrl = buildFirefliesTimestampUrl(snip.callId, snip.startTime);
+                      return tsUrl ? (
+                        <a href={tsUrl} target="_blank" rel="noopener noreferrer"
+                          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#1a1a2e] border border-[#2a2a3e] text-cyan-400 hover:bg-cyan-500/15 hover:border-cyan-500/30 transition-colors cursor-pointer"
+                          style={{ fontSize: "0.6rem" }}
+                          title={`Jump to ${formatTimestamp(snip.startTime)} in Fireflies.ai`}
+                        >
+                          <Clock className="w-2.5 h-2.5" />{formatTimestamp(snip.startTime)}<ExternalLink className="w-2 h-2 opacity-60" />
+                        </a>
+                      ) : null;
+                    })()}
+                    <RecordingLink url={snip.recordingUrl} compact />
                   </div>
                 </div>
-                <span className="px-2.5 py-1 rounded-lg bg-[#ec5d25]/15 text-[#f5a07a]" style={{ fontSize: "0.72rem", fontWeight: 600 }}>{m.mentionCount} hit{m.mentionCount !== 1 ? "s" : ""}</span>
+                <span className="px-2 py-0.5 rounded bg-[#ec5d25]/15 text-[#f5a07a] shrink-0 ml-2" style={{ fontSize: "0.65rem", fontWeight: 600 }}>
+                  {snip.mentionCount} hit{snip.mentionCount !== 1 ? "s" : ""}
+                </span>
               </div>
-              {/* Transcript evidence snippets */}
-              {m.snippets.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  {m.snippets.map((snip, si) => (
-                    <div key={si} className="pl-3 border-l-2 border-[#ec5d25]/30">
-                      <div className="flex items-center gap-2 mb-0.5">
-                        {snip.speakerName && (
-                          <span className="text-[#f5a07a]" style={{ fontSize: "0.68rem", fontWeight: 600 }}>{snip.speakerName}:</span>
-                        )}
-                        {snip.startTime !== undefined && snip.startTime >= 0 && (() => {
-                          const tsUrl = buildFirefliesTimestampUrl(m.callId, snip.startTime);
-                          return tsUrl ? (
-                            <a
-                              href={tsUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#1a1a2e] border border-[#2a2a3e] text-cyan-400 hover:bg-cyan-500/15 hover:border-cyan-500/30 hover:text-cyan-300 transition-colors cursor-pointer"
-                              style={{ fontSize: "0.6rem", fontWeight: 500 }}
-                              title={`Jump to ${formatTimestamp(snip.startTime)} in Fireflies.ai`}
-                            >
-                              <Clock className="w-2.5 h-2.5" />
-                              {formatTimestamp(snip.startTime)}
-                              <ExternalLink className="w-2 h-2 opacity-60" />
-                            </a>
-                          ) : (
-                            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#1a1a2e] border border-[#2a2a3e] text-cyan-400" style={{ fontSize: "0.6rem", fontWeight: 500 }}>
-                              <Clock className="w-2.5 h-2.5" />
-                              {formatTimestamp(snip.startTime)}
-                            </span>
-                          );
-                        })()}
-                      </div>
-                      <p className="text-[#c0c0d0] italic" style={{ fontSize: "0.75rem" }}>
-                        "{snip.text.slice(0, 250)}{snip.text.length > 250 ? "..." : ""}"
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <p className="text-[#a0a0b8] italic border-l-2 border-[#ec5d25]/30 pl-3" style={{ fontSize: "0.75rem" }}>
+                "{snip.text.slice(0, 240)}{snip.text.length > 240 ? "…" : ""}"
+              </p>
             </div>
           ))}
         </div>
-      ) : (
-        /* Table view — structured comparison */
-        <div className="bg-[#12121c] border border-[#1e1e2e] rounded-xl overflow-hidden">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-[#1e1e2e]">
-                <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Call</th>
-                <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>AE</th>
-                <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Date</th>
-                <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Mentions</th>
-                <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Source</th>
-                <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Evidence</th>
-                <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Recording</th>
-              </tr>
-            </thead>
-            <tbody>
-              {mentions.map((m, i) => (
-                <tr key={`${m.callId}-${i}`} className="border-b border-[#1e1e2e] last:border-b-0 hover:bg-[#1a1a28]">
-                  <td className="px-4 py-2.5 text-white max-w-[160px] truncate" style={{ fontSize: "0.78rem" }}>{m.callTitle}</td>
-                  <td className="px-4 py-2.5 text-[#c0c0d0]" style={{ fontSize: "0.78rem" }}>{m.aeName}</td>
-                  <td className="px-4 py-2.5 text-[#c0c0d0]" style={{ fontSize: "0.78rem" }}>{m.date}</td>
-                  <td className="px-4 py-2.5 text-center">
-                    <span className="px-2 py-0.5 rounded bg-[#ec5d25]/20 text-[#f5a07a]" style={{ fontSize: "0.7rem", fontWeight: 600 }}>{m.mentionCount}</span>
-                  </td>
-                  <td className="px-4 py-2.5" style={{ fontSize: "0.68rem" }}>
-                    <span className={`px-2 py-0.5 rounded ${
-                      m.source === "transcript" ? "bg-emerald-500/20 text-emerald-300"
-                      : m.source === "summary" ? "bg-blue-500/20 text-blue-300"
-                      : m.source === "keywords" ? "bg-amber-500/20 text-amber-300"
-                      : "bg-purple-500/20 text-purple-300"
-                    }`}>{m.source}</span>
-                  </td>
-                  <td className="px-4 py-2.5 text-[#8888a0] italic max-w-[220px]" style={{ fontSize: "0.72rem" }}>
-                    {m.snippets[0]?.text ? (
-                      <span>
-                        {m.snippets[0].startTime !== undefined && m.snippets[0].startTime >= 0 && (() => {
-                          const tsUrl = buildFirefliesTimestampUrl(m.callId, m.snippets[0].startTime);
-                          return tsUrl ? (
-                            <a
-                              href={tsUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-[#1a1a2e] border border-[#2a2a3e] text-cyan-400 hover:bg-cyan-500/15 hover:border-cyan-500/30 hover:text-cyan-300 transition-colors not-italic mr-1 cursor-pointer"
-                              style={{ fontSize: "0.58rem", fontWeight: 500 }}
-                              title={`Jump to ${formatTimestamp(m.snippets[0].startTime)} in Fireflies.ai`}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <Clock className="w-2 h-2" />
-                              {formatTimestamp(m.snippets[0].startTime)}
-                              <ExternalLink className="w-1.5 h-1.5 opacity-60" />
-                            </a>
-                          ) : (
-                            <span className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-[#1a1a2e] border border-[#2a2a3e] text-cyan-400 not-italic mr-1" style={{ fontSize: "0.58rem", fontWeight: 500 }}>
-                              <Clock className="w-2 h-2" />
-                              {formatTimestamp(m.snippets[0].startTime)}
-                            </span>
-                          );
-                        })()}
-                        {m.snippets[0].speakerName && <span className="text-[#f5a07a] not-italic" style={{ fontWeight: 500 }}>{m.snippets[0].speakerName}: </span>}
-                        "{m.snippets[0].text.slice(0, 140)}{m.snippets[0].text.length > 140 ? "..." : ""}"
-                      </span>
-                    ) : <span className="text-[#555568]">No evidence</span>}
-                  </td>
-                  <td className="px-4 py-2.5 text-center">
-                    <RecordingLink url={m.recordingUrl} compact />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      )}
+
+      {/* Expandable full call list */}
+      {mentions.length > 4 && (
+        <div>
+          <button
+            onClick={() => setShowAll(!showAll)}
+            className="flex items-center gap-1 text-[#ec5d25] hover:text-[#f5a07a] transition-colors"
+            style={{ fontSize: "0.75rem" }}
+          >
+            {showAll ? <><ChevronUp className="w-3 h-3" /> Show less</> : <><ChevronDown className="w-3 h-3" /> View all {mentions.length} calls</>}
+          </button>
+          {showAll && (
+            <div className="mt-3 bg-[#12121c] border border-[#1e1e2e] rounded-xl overflow-hidden">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-[#1e1e2e]">
+                    <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Call</th>
+                    <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>AE</th>
+                    <th className="px-4 py-2.5 text-left text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Date</th>
+                    <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Mentions</th>
+                    <th className="px-4 py-2.5 text-center text-[#8888a0]" style={{ fontSize: "0.7rem", fontWeight: 500 }}>Recording</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mentions.map((m, i) => (
+                    <tr key={`${m.callId}-${i}`} className="border-b border-[#1e1e2e] last:border-b-0 hover:bg-[#1a1a28]">
+                      <td className="px-4 py-2.5 text-white max-w-[200px] truncate" style={{ fontSize: "0.78rem" }}>{m.callTitle}</td>
+                      <td className="px-4 py-2.5 text-[#c0c0d0]" style={{ fontSize: "0.78rem" }}>{m.aeName}</td>
+                      <td className="px-4 py-2.5 text-[#c0c0d0]" style={{ fontSize: "0.78rem" }}>{m.date}</td>
+                      <td className="px-4 py-2.5 text-center">
+                        <span className="px-2 py-0.5 rounded bg-[#ec5d25]/20 text-[#f5a07a]" style={{ fontSize: "0.7rem", fontWeight: 600 }}>{m.mentionCount}</span>
+                      </td>
+                      <td className="px-4 py-2.5 text-center">
+                        <RecordingLink url={m.recordingUrl} compact />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2587,6 +2596,62 @@ export function FollowUpSuggestions({ suggestions, onSelect }: { suggestions: st
       </div>
     </div>
   );
+}
+
+// =====================================================================
+// LLM Streaming — POST /final-response
+// Streams an LLM-generated conversational narrative for a result set.
+// Calls onChunk for each token; resolves when the stream ends.
+// Falls back gracefully if the server is unreachable.
+// =====================================================================
+
+export async function streamFinalResponse(
+  resultData: ResultData,
+  parsedQuery: ParsedQuery,
+  formattedIntro: string,
+  onChunk: (token: string) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${SERVER_BASE}/final-response`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resultData, parsedQuery, formattedIntro }),
+      signal,
+    });
+  } catch {
+    onChunk(formattedIntro);
+    return;
+  }
+
+  if (!response.ok || !response.body) {
+    onChunk(formattedIntro);
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "[DONE]") return;
+      try {
+        const evt = JSON.parse(payload) as { token?: string };
+        if (evt.token) onChunk(evt.token);
+      } catch { /* skip malformed chunk */ }
+    }
+  }
 }
 
 export function ResultRenderer({ data }: { data: ResultData }) {

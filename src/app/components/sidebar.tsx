@@ -8,11 +8,13 @@ import {
   Settings,
   Flame,
   Package,
+  LogOut,
 } from "lucide-react";
 import { useData } from "./data-context";
+import { useAuth } from "../auth";
 
 const navItems = [
-  { to: "/", icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/ask-ai", icon: MessageSquare, label: "Ask Merlin" },
   { to: "/calls", icon: Library, label: "Calls Library" },
   { to: "/insights", icon: Lightbulb, label: "Insights" },
@@ -22,7 +24,8 @@ const navItems = [
 ];
 
 export function Sidebar() {
-  const { isLive, isLoading, user, lastSynced } = useData();
+  const { isLive, isLoading, lastSynced } = useData();
+  const { email, logout } = useAuth();
 
   return (
     <aside className="w-64 h-screen bg-[#0f0f13] border-r border-[#1e1e2e] flex flex-col shrink-0">
@@ -38,7 +41,7 @@ export function Sidebar() {
           <NavLink
             key={item.to}
             to={item.to}
-            end={item.to === "/"}
+            end
             className={({ isActive }) =>
               `flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${
                 isActive
@@ -69,13 +72,19 @@ export function Sidebar() {
           )}
         </div>
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-[#ec5d25] to-[#c4400e] flex items-center justify-center text-white" style={{ fontSize: "0.75rem", fontWeight: 600 }}>
-            {user ? user.name.split(" ").map(n => n[0]).join("").slice(0,2) : "JD"}
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-[#ec5d25] to-[#c4400e] flex items-center justify-center text-white shrink-0" style={{ fontSize: "0.75rem", fontWeight: 600 }}>
+            {email ? email[0].toUpperCase() : "?"}
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-white truncate" style={{ fontSize: "0.875rem" }}>{user?.name || "John Doe"}</p>
-            <p className="text-[#8888a0] truncate" style={{ fontSize: "0.75rem" }}>{user?.email || "Admin"}</p>
+            <p className="text-[#8888a0] truncate" style={{ fontSize: "0.72rem" }}>{email}</p>
           </div>
+          <button
+            onClick={logout}
+            title="Sign out"
+            className="text-[#555568] hover:text-red-400 transition-colors shrink-0"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </div>
     </aside>

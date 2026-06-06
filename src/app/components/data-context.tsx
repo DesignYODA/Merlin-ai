@@ -34,9 +34,9 @@ function isHiringMeetingFE(title: string): boolean {
 }
 
 function shouldShowMeeting(call: NormalizedCall): boolean {
-  // Rule 0 — Exclude calls shorter than 1 minute
+  // Rule 0 — Exclude calls shorter than 1 minute (duration is in minutes)
   const raw = call.raw;
-  if (raw && typeof raw.duration === "number" && raw.duration > 0 && raw.duration < 60) {
+  if (raw && typeof raw.duration === "number" && raw.duration > 0 && raw.duration < 1) {
     return false;
   }
 
@@ -103,6 +103,44 @@ interface SyncStatus {
   updatedCalls: number;
 }
 
+export interface AnalyticsSummary {
+  totalCalls: number;
+  uniqueTopics: number;
+  activeAEs: number;
+  totalActionItems: number;
+  positiveSentiment: number;
+  neutralSentiment: number;
+  negativeSentiment: number;
+}
+
+export interface Analytics {
+  summary: AnalyticsSummary | null;
+  callsByDay: Array<{ day: string; count: number }>;
+  topTopics: Array<{ topic: string; count: number; callIds: string[] }>;
+  topAEs: Array<{ aeName: string; aeEmail: string; callCount: number }>;
+  callActionItems: Array<{
+    callId: string;
+    callTitle: string;
+    aeName: string;
+    aeEmail: string;
+    dateTs: number;
+    transcriptUrl: string;
+    actionItems: string[];
+  }>;
+  computedAt: number | null;
+}
+
+export interface ProductInsightResult {
+  callId: string;
+  callTitle: string;
+  aeName: string;
+  clientName: string;
+  date: string;
+  transcriptUrl: string;
+  items: string[];
+  analyzedAt: number;
+}
+
 export interface HubSpotDeal {
   id: string;
   properties: Record<string, string>;
@@ -124,18 +162,32 @@ export interface HubSpotContact {
   updatedAt?: string;
 }
 
+const EMPTY_ANALYTICS: Analytics = {
+  summary: null,
+  callsByDay: [],
+  topTopics: [],
+  topAEs: [],
+  callActionItems: [],
+  computedAt: null,
+};
+
 interface DataContextType {
   calls: NormalizedCall[];
   hubspotDeals: HubSpotDeal[];
   hubspotCompanies: HubSpotCompany[];
   hubspotContacts: HubSpotContact[];
+  productInsights: ProductInsightResult[];
+  analytics: Analytics;
   user: FirefliesUser | null;
   isLoading: boolean;
   error: string | null;
   isLive: boolean;
   refresh: () => void;
   fullSync: () => void;
+  refreshHubspot: () => Promise<void>;
+  isHubspotRefreshing: boolean;
   getCallDetail: (id: string) => Promise<NormalizedCall | null>;
+  setProductInsights: (results: ProductInsightResult[]) => void;
   lastSynced: Date | null;
   totalCallsFetched: number;
   fetchProgress: string;
@@ -149,13 +201,18 @@ const DataContext = createContext<DataContextType>({
   hubspotDeals: [],
   hubspotCompanies: [],
   hubspotContacts: [],
+  productInsights: [],
+  analytics: EMPTY_ANALYTICS,
   user: null,
   isLoading: true,
   error: null,
   isLive: false,
   refresh: () => {},
   fullSync: () => {},
+  refreshHubspot: async () => {},
+  isHubspotRefreshing: false,
   getCallDetail: async () => null,
+  setProductInsights: () => {},
   lastSynced: null,
   totalCallsFetched: 0,
   fetchProgress: "",
@@ -286,6 +343,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [hubspotDeals, setHubspotDeals] = useState<HubSpotDeal[]>([]);
   const [hubspotCompanies, setHubspotCompanies] = useState<HubSpotCompany[]>([]);
   const [hubspotContacts, setHubspotContacts] = useState<HubSpotContact[]>([]);
+  const [productInsights, setProductInsights] = useState<ProductInsightResult[]>([]);
   const [user, setUser] = useState<FirefliesUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -295,9 +353,50 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [fetchProgress, setFetchProgress] = useState("");
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isHubspotRefreshing, setIsHubspotRefreshing] = useState(false);
   const [dbCallCount, setDbCallCount] = useState(0);
+  const [analytics, setAnalytics] = useState<Analytics>(EMPTY_ANALYTICS);
   const syncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const incrementalSyncRef = useRef<() => void>(() => {});
+
+  // Load cached product insights from SQLite
+  const loadProductInsights = useCallback(async () => {
+    try {
+      const data = await serverFetch("/product-insights");
+      setProductInsights(data.results || []);
+    } catch {
+      // Non-fatal — insights will be empty until first analysis
+    }
+  }, []);
+
+  // Load pre-computed analytics from the analytical store
+  const loadAnalytics = useCallback(async () => {
+    try {
+      const data = await serverFetch("/analytics");
+      setAnalytics(data ?? EMPTY_ANALYTICS);
+    } catch {
+      // Non-fatal — UI falls back to EMPTY_ANALYTICS
+    }
+  }, []);
+
+  // Analyze a specific set of call IDs and append results to the insights cache
+  const analyzeCallIds = useCallback(async (callIds: string[]) => {
+    if (!callIds.length) return;
+    try {
+      const data = await serverFetch("/product-requests/analyze", {
+        method: "POST",
+        body: JSON.stringify({ callIds }),
+        timeoutMs: 120000,
+      });
+      if (data.newCount > 0) {
+        // Reload from DB so state reflects everything persisted (new + previously cached)
+        const fresh = await serverFetch("/product-insights");
+        setProductInsights(fresh.results || []);
+      }
+    } catch (err: any) {
+      console.warn("Background analysis failed:", err.message);
+    }
+  }, []);
 
   // Load calls + HubSpot data in parallel from /data
   const loadFromDb = useCallback(async () => {
@@ -314,8 +413,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
         filtered.sort((a: NormalizedCall, b: NormalizedCall) => (b.dateTimestamp || 0) - (a.dateTimestamp || 0));
         setCalls(filtered);
         setTotalCallsFetched(filtered.length);
-        setDbCallCount(filtered.length);
-        setFetchProgress(`${filtered.length} calls loaded from database`);
+        // Use server's totalCount (server-filtered DB count) so "Calls Stored" in
+        // Settings matches syncStatus.totalCalls, not the stricter frontend filter.
+        setDbCallCount(data.totalCount ?? filtered.length);
+        setFetchProgress(`${data.totalCount ?? filtered.length} calls loaded from database`);
       }
       setHubspotDeals(data.deals || []);
       setHubspotCompanies(data.companies || []);
@@ -348,8 +449,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
         });
         setLastSynced(new Date(data.lastSyncAt));
         setFetchProgress(`Synced ${data.totalCalls} calls (${data.newCalls} new)`);
-        // Reload from DB to get the fresh data
         await loadFromDb();
+        loadAnalytics();
+        // Analyze calls that don't yet have cached insights
+        const insightsRes = await serverFetch("/product-insights");
+        const cachedIds = new Set((insightsRes.results || []).map((r: { callId: string }) => r.callId));
+        const uncachedIds = (data.newCallIds || []).filter((id: string) => !cachedIds.has(id));
+        analyzeCallIds(uncachedIds);
       } else {
         setFetchProgress("Sync completed with warnings");
       }
@@ -360,7 +466,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsSyncing(false);
     }
-  }, [loadFromDb]);
+  }, [loadFromDb, analyzeCallIds, loadAnalytics]);
 
   // Incremental sync: only fetch new calls
   const incrementalSync = useCallback(async () => {
@@ -380,6 +486,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
         if (data.newCalls > 0) {
           setFetchProgress(`${data.newCalls} new call(s) found!`);
           await loadFromDb();
+          loadAnalytics();
+          analyzeCallIds(data.newCallIds || []);
         } else {
           setFetchProgress(`Up to date · ${data.totalCalls} calls`);
         }
@@ -390,30 +498,30 @@ export function DataProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsSyncing(false);
     }
-  }, [loadFromDb]);
+  }, [loadFromDb, analyzeCallIds, loadAnalytics]);
 
-  // Initial load: DB first → if empty, full sync
+  // Initial load: show DB data immediately, sync in background
   const initialLoad = useCallback(async () => {
     setIsLoading(true);
     setError(null);
-
-    // User info is now managed through backend (or safely omitted)
     setUser(null);
 
-    // Try loading from DB
+    // Load DB data, cached insights, and analytics in parallel
+    loadProductInsights();
+    loadAnalytics();
     const hasDbData = await loadFromDb();
 
+    // Unblock the UI as soon as the DB read is done
+    setIsLoading(false);
+
+    // Background sync — never awaited, UI stays responsive
     if (!hasDbData) {
-      // DB is empty, do a full sync
-      setFetchProgress("No data in database, performing initial sync...");
-      await fullSync();
+      setFetchProgress("Syncing from Fireflies in background…");
+      fullSync();
     } else {
-      // DB has data, do an incremental sync in background
       incrementalSync();
     }
-
-    setIsLoading(false);
-  }, [loadFromDb, fullSync, incrementalSync]);
+  }, [loadFromDb, loadProductInsights, loadAnalytics, fullSync, incrementalSync]);
 
   useEffect(() => {
     initialLoad();
@@ -453,6 +561,30 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [calls]
   );
 
+  // Refetch HubSpot deals / companies / contacts from the live API
+  const refreshHubspot = useCallback(async () => {
+    if (isHubspotRefreshing) return;
+    setIsHubspotRefreshing(true);
+    try {
+      const [dealsRes, companiesRes, contactsRes] = await Promise.allSettled([
+        serverFetch("/hubspot/deals"),
+        serverFetch("/hubspot/companies"),
+        serverFetch("/hubspot/contacts"),
+      ]);
+      if (dealsRes.status === "fulfilled") setHubspotDeals(dealsRes.value.results || []);
+      if (companiesRes.status === "fulfilled") setHubspotCompanies(companiesRes.value.results || []);
+      if (contactsRes.status === "fulfilled") setHubspotContacts(contactsRes.value.results || []);
+      const errs = [dealsRes, companiesRes, contactsRes]
+        .filter((r) => r.status === "rejected")
+        .map((r) => (r as PromiseRejectedResult).reason?.message);
+      if (errs.length) console.warn("[hubspot refresh] partial failure:", errs.join("; "));
+    } catch (err: any) {
+      console.error("[hubspot refresh] failed:", err.message);
+    } finally {
+      setIsHubspotRefreshing(false);
+    }
+  }, [isHubspotRefreshing]);
+
   // Manual refresh (incremental sync)
   const refresh = useCallback(() => {
     incrementalSync();
@@ -466,13 +598,18 @@ export function DataProvider({ children }: { children: ReactNode }) {
         hubspotDeals,
         hubspotCompanies,
         hubspotContacts,
+        productInsights,
+        analytics,
         user,
         isLoading,
         error,
         isLive,
         refresh,
         fullSync,
+        refreshHubspot,
+        isHubspotRefreshing,
         getCallDetail,
+        setProductInsights,
         lastSynced,
         totalCallsFetched,
         fetchProgress,

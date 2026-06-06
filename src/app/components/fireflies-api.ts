@@ -40,12 +40,12 @@ export interface FirefliesUser {
 
 // ---- Helpers ----
 
-export function formatDuration(seconds: number): string {
-  if (!seconds || seconds <= 0) return "0 min";
-  const mins = Math.round(seconds / 60);
-  if (mins < 60) return `${mins} min`;
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
+export function formatDuration(minutes: number): string {
+  if (!minutes || minutes <= 0) return "0 min";
+  const totalMins = Math.round(minutes);
+  if (totalMins < 60) return `${totalMins} min`;
+  const hrs = Math.floor(totalMins / 60);
+  const remainMins = totalMins % 60;
   return `${hrs}h ${remainMins}m`;
 }
 
