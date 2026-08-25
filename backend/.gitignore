@@ -1,0 +1,35 @@
+# Ignore database and local data directories/files
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Common environment files
+.env
+.env.*
+!.env.example
+
+# Log files and crash dumps
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# System/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Compiled python artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Node dependencies (if any)
+node_modules/

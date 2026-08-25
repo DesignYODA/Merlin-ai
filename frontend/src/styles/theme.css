@@ -1,0 +1,375 @@
+@import url('https://fonts.googleapis.com/css2?family=Fustat:wght@400;500;600;700;800&family=Geist:wght@300;400;500;600;700&display=swap');
+
+@custom-variant dark (&:is(.dark *));
+
+/* ─────────────────────────────────────────────────────────
+   Base (warm dark — matches landing page)
+───────────────────────────────────────────────────────── */
+:root {
+  --font-size: 20px;
+
+  /* ── Brand palette ── */
+  --brand-orange: #EC5D25;
+  --brand-green:  #006403;
+
+  /* ── Dashboard layout geometry ── */
+  --dash-dark:   #0D0200;   /* page background */
+  --dash-light:  #F5F2EE;
+  --card-r:      12px;
+  --card-gap:    8px;
+  --card-inner:  28px;
+  --outer-pad:   2px;
+
+  /* ── Card typography colors ── */
+  --card-border:  #301000;
+  --card-divider: #1E0900;
+  --card-hover:   #1A0700;
+  --card-label:   #C8B4A8;
+  --card-muted:   #D8C8C0;
+  --card-subtle:  #7A6058;
+
+  /* ── Card background ── */
+  --card-bg: #301501;
+
+  /* ── Card surface tokens ── */
+  --dash-card-border: rgba(255,255,255,0.08);
+  --dash-card-text:   #F0ECE8;
+  --dash-card-hover:  rgba(236,93,37,0.06);
+  --dash-divider:     rgba(255,255,255,0.06);
+  --dash-track:       #301000;
+
+  /* ── Dashboard font scale ── */
+  --fs-large:   0.88rem;
+  --fs-label:   0.72rem;
+  --fs-medium:  0.68rem;
+  --fs-big:     0.65rem;
+  --fs-small:   0.65rem;
+  --fs-tiny:    0.6rem;
+  --fs-stat:    2rem;
+  --fs-stat-lg: 2.2rem;
+
+  /* App layer palette */
+  --app-base:     #0D0200;   /* page bg                   */
+  --app-surface:  #110400;   /* sidebar / secondary panels */
+  --app-card:     #180600;   /* card / panel bg            */
+  --app-elevated: #200800;   /* hover rows, active items   */
+  --app-overlay:  #280B00;   /* selected / inline emphasis */
+  --app-border:   #301000;   /* borders, dividers          */
+  --app-fg:       #F0ECE8;   /* primary text               */
+  --app-fg-muted: #A89088;   /* secondary / muted text     */
+  --app-fg-subtle:#6A5848;   /* placeholder / subtle       */
+  --app-fg-dim:   #C8B8B0;   /* transcript / secondary content */
+
+  /* shadcn / Radix tokens */
+  --background: #0D0200;
+  --foreground: #F0ECE8;
+  --card: #180600;
+  --card-foreground: #F0ECE8;
+  --popover: #200800;
+  --popover-foreground: #F0ECE8;
+  --primary: #EC5D25;
+  --primary-foreground: #ffffff;
+  --secondary: #200800;
+  --secondary-foreground: #F0ECE8;
+  --muted: #280B00;
+  --muted-foreground: #A89088;
+  --accent: #200800;
+  --accent-foreground: #F0ECE8;
+  --destructive: #d4183d;
+  --destructive-foreground: #ffffff;
+  --border: #301000;
+  --input: #200800;
+  --input-background: #180600;
+  --switch-background: #3A1400;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: #EC5D25;
+  --chart-1: #EC5D25;
+  --chart-2: #006403;
+  --chart-3: #8b5cf6;
+  --chart-4: #60a5fa;
+  --chart-5: #fbbf24;
+  --radius: 0.625rem;
+  --sidebar: #110400;
+  --sidebar-foreground: #F0ECE8;
+  --sidebar-primary: #EC5D25;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #200800;
+  --sidebar-accent-foreground: #F0ECE8;
+  --sidebar-border: #301000;
+  --sidebar-ring: #EC5D25;
+}
+
+/* ─────────────────────────────────────────────────────────
+   Dark override (same warm-dark palette)
+───────────────────────────────────────────────────────── */
+.dark {
+  /* App layer palette */
+  --app-base:     #0D0200;
+  --app-surface:  #110400;
+  --app-card:     #180600;
+  --app-elevated: #200800;
+  --app-overlay:  #280B00;
+  --app-border:   #301000;
+  --app-fg:       #F0ECE8;
+  --app-fg-muted: #A89088;
+  --app-fg-subtle:#6A5848;
+  --app-fg-dim:   #C8B8B0;
+
+  /* shadcn / Radix tokens */
+  --background: #0D0200;
+  --foreground: #F0ECE8;
+  --card: #180600;
+  --card-foreground: #F0ECE8;
+  --popover: #200800;
+  --popover-foreground: #F0ECE8;
+  --primary: #EC5D25;
+  --primary-foreground: #ffffff;
+  --secondary: #200800;
+  --secondary-foreground: #F0ECE8;
+  --muted: #280B00;
+  --muted-foreground: #A89088;
+  --accent: #200800;
+  --accent-foreground: #F0ECE8;
+  --destructive: #d4183d;
+  --destructive-foreground: #ffffff;
+  --border: #301000;
+  --input: #200800;
+  --ring: #EC5D25;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --chart-1: #EC5D25;
+  --chart-2: #006403;
+  --chart-3: #8b5cf6;
+  --chart-4: #60a5fa;
+  --chart-5: #fbbf24;
+  --sidebar: #110400;
+  --sidebar-foreground: #F0ECE8;
+  --sidebar-primary: #EC5D25;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #200800;
+  --sidebar-accent-foreground: #F0ECE8;
+  --sidebar-border: #301000;
+  --sidebar-ring: #EC5D25;
+}
+
+/* ─────────────────────────────────────────────────────────
+   Tailwind theme registration
+───────────────────────────────────────────────────────── */
+@theme inline {
+  /* Brand palette */
+  --color-brand-orange: var(--brand-orange);
+  --color-brand-green:  var(--brand-green);
+
+  /* Dashboard tokens */
+  /* Dashboard light-section tokens */
+  --color-dash-dark:    var(--dash-dark);
+  --color-dash-light:   var(--dash-light);
+  --color-card-border:  var(--card-border);
+  --color-card-divider: var(--card-divider);
+  --color-card-hover:   var(--card-hover);
+  --color-card-label:   var(--card-label);
+  --color-card-muted:   var(--card-muted);
+  --color-card-subtle:  var(--card-subtle);
+
+  /* Dashboard card tokens */
+  --color-card-bg:          var(--card-bg);
+  --color-dash-card-border: var(--dash-card-border);
+  --color-dash-card-text:   var(--dash-card-text);
+  --color-dash-card-hover:  var(--dash-card-hover);
+  --color-dash-divider:     var(--dash-divider);
+
+  /* App palette — generates bg-app-base, bg-app-card, text-app-fg, etc. */
+  --color-app-base:     var(--app-base);
+  --color-app-surface:  var(--app-surface);
+  --color-app-card:     var(--app-card);
+  --color-app-elevated: var(--app-elevated);
+  --color-app-overlay:  var(--app-overlay);
+  --color-app-border:   var(--app-border);
+  --color-app-fg:       var(--app-fg);
+  --color-app-fg-muted: var(--app-fg-muted);
+  --color-app-fg-subtle:var(--app-fg-subtle);
+  --color-app-fg-dim:   var(--app-fg-dim);
+
+  /* shadcn tokens */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInFromRight {
+  from { opacity: 0; transform: translateX(32px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes fadeInOverlay {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes floatYIcon {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+
+@keyframes hotspotPulse {
+  0%, 100%   { box-shadow: 0 0 0 0 rgba(236,93,37,0.35); }
+  50%        { box-shadow: 0 0 0 8px rgba(236,93,37,0.06); }
+}
+
+@keyframes markerPing {
+  75%, 100% { transform: scale(2.2); opacity: 0; }
+}
+
+/* ─────────────────────────────────────────────────────────
+   HubSpot note body — parsed rich-text HTML from note_hs_note_body
+───────────────────────────────────────────────────────── */
+.hs-note-body > * + * {
+  margin-top: 10px;
+}
+
+.hs-note-body h1, .hs-note-body h2, .hs-note-body h3,
+.hs-note-body h4, .hs-note-body h5, .hs-note-body h6 {
+  font-size: 18px !important;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 0;
+  color: var(--dash-card-text);
+}
+
+.hs-note-body p {
+  font-size: 15px !important;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.hs-note-body ul, .hs-note-body ol {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hs-note-body li {
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+* {
+  scrollbar-color: transparent transparent;
+}
+
+*::-webkit-scrollbar {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Geist', sans-serif;
+  }
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Fustat', sans-serif;
+  }
+
+  h1 {
+    font-size: 42px;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.3;
+  }
+
+  h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  h4 {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  label {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+}
+
