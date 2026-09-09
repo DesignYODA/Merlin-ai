@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useRef, type ReactNode } from "react";
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
 import {
   formatDuration,
   formatDate,
@@ -622,38 +622,50 @@ export function DataProvider({ children }: { children: ReactNode }) {
     incrementalSync();
   }, [incrementalSync]);
 
+  // Every consumer of useData() re-renders whenever this value's reference
+  // identity changes — an inline object literal here would give it a new
+  // identity on every DataProvider render (e.g. every setFetchProgress()
+  // call during a sync), cascading a re-render through every page that
+  // reads from context regardless of whether the fields it actually uses
+  // changed. Memoizing keeps identity stable across renders that don't
+  // touch any of these values.
+  const contextValue = useMemo<DataContextType>(() => ({
+    calls,
+    hubspotDeals,
+    hubspotCompanies,
+    hubspotContacts,
+    productInsights,
+    analytics,
+    user,
+    isLoading,
+    error,
+    isLive,
+    refresh,
+    fullSync,
+    refreshHubspot,
+    isHubspotRefreshing,
+    runHubspotSync,
+    runHubspotIncrementalSync,
+    isHubspotSyncing,
+    hubspotSyncStatus,
+    getCallDetail,
+    setProductInsights,
+    lastSynced,
+    totalCallsFetched,
+    fetchProgress,
+    syncStatus,
+    isSyncing,
+    dbCallCount,
+  }), [
+    calls, hubspotDeals, hubspotCompanies, hubspotContacts, productInsights, analytics,
+    user, isLoading, error, isLive, refresh, fullSync, refreshHubspot, isHubspotRefreshing,
+    runHubspotSync, runHubspotIncrementalSync, isHubspotSyncing, hubspotSyncStatus,
+    getCallDetail, setProductInsights, lastSynced, totalCallsFetched, fetchProgress,
+    syncStatus, isSyncing, dbCallCount,
+  ]);
+
   return (
-    <
-      DataContext.Provider
-      value={{
-        calls,
-        hubspotDeals,
-        hubspotCompanies,
-        hubspotContacts,
-        productInsights,
-        analytics,
-        user,
-        isLoading,
-        error,
-        isLive,
-        refresh,
-        fullSync,
-        refreshHubspot,
-        isHubspotRefreshing,
-        runHubspotSync,
-        runHubspotIncrementalSync,
-        isHubspotSyncing,
-        hubspotSyncStatus,
-        getCallDetail,
-        setProductInsights,
-        lastSynced,
-        totalCallsFetched,
-        fetchProgress,
-        syncStatus,
-        isSyncing,
-        dbCallCount,
-      }}
-    >
+    <DataContext.Provider value={contextValue}>
       {children}
     </DataContext.Provider>
   );

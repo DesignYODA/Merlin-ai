@@ -19,7 +19,15 @@ from db.merlin_db import (
     upsert_product_insights, get_all_product_insights, get_all_product_insights_replica,
     delete_product_insights,
     replicate_to_read_replica as _replicate_merlin,
+    create_auth_user as _create_auth_user,
+    get_auth_user as _get_auth_user,
+    update_auth_last_logged_in as _update_auth_last_logged_in,
+    update_auth_password as _update_auth_password,
+    create_session as _create_auth_session,
+    get_session as _get_auth_session,
+    delete_session as _delete_auth_session,
 )
+from utils.security import hash_secret, verify_secret, generate_token
 from db.analytical_db import (
     process_analytics as _process_analytics,
     get_analytics as _get_analytics,
@@ -1269,3 +1277,114 @@ async def chat_generate_title(session_id: str, first_message: str) -> dict:
     _update_session(session_id=session_id, chat_summary=title)
     logger.info("[chat-title] session=%s title=%r", session_id, title)
     return {"title": title}
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000  # 7 days
+
+
+def _extract_token(auth_header: str | None) -> str | None:
+    if not auth_header:
+        return None
+    auth_header = auth_header.strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip() or None
+    return auth_header or None  # tolerate a bare token, no "Bearer " prefix
+
+
+def _public_auth_user(user: dict) -> dict:
+    return {
+        "email": user["emailid"],
+        "username": user["username"],
+        "securityquestion": user["securityquestion"],
+        "lastloggedin": user.get("lastloggedin"),
+    }
+
+
+def auth_signup(email: str, username: str, password: str, securityquestion: str, answer: str) -> dict:
+    email = (email or "").strip().lower()
+    username = (username or "").strip()
+    securityquestion = (securityquestion or "").strip()
+    answer = (answer or "").strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if not securityquestion or not answer:
+        raise HTTPException(status_code=400, detail="Security question and answer are required")
+    if _get_auth_user(email):
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    user = _create_auth_user(
+        emailid=email,
+        username=username,
+        password_hash=hash_secret(password),
+        securityquestion=securityquestion,
+        answer_hash=hash_secret(answer.lower()),
+    )
+    logger.info("[auth] signup for %s", email)
+    return _public_auth_user(user)
+
+
+def auth_login(email: str, password: str) -> dict:
+    email = (email or "").strip().lower()
+    user = _get_auth_user(email)
+    if not user or not verify_secret(password or "", user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    _update_auth_last_logged_in(email, now_ms)
+    user["lastloggedin"] = now_ms
+
+    token = generate_token()
+    _create_auth_session(token, email, _SESSION_TTL_MS)
+
+    logger.info("[auth] login for %s", email)
+    return {**_public_auth_user(user), "token": token}
+
+
+def auth_logout(authorization: str | None) -> dict:
+    token = _extract_token(authorization)
+    if token:
+        try:
+            _delete_auth_session(token)
+        except Exception:
+            pass
+    return {"success": True}
+
+
+def auth_verify_token(authorization: str | None) -> str:
+    token = _extract_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    session = _get_auth_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return session["emailid"]
+
+
+def auth_get_security_question(email: str) -> dict:
+    email = (email or "").strip().lower()
+    user = _get_auth_user(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this email")
+    return {"securityquestion": user["securityquestion"]}
+
+
+def auth_reset_password(email: str, answer: str, new_password: str) -> dict:
+    email = (email or "").strip().lower()
+    user = _get_auth_user(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this email")
+    if not verify_secret((answer or "").strip().lower(), user["answer"]):
+        raise HTTPException(status_code=401, detail="Security answer is incorrect")
+    if not new_password or len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    _update_auth_password(email, hash_secret(new_password))
+    logger.info("[auth] password reset for %s", email)
+    return {"success": True}

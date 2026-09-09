@@ -3,7 +3,7 @@ lambda_handler.py — AWS Lambda entry point.
 
 Wraps the existing FastAPI app (main:app) with Mangum so it can run behind
 API Gateway (REST or HTTP API) or a Lambda Function URL, unchanged from its
-local uvicorn deployment.
+local uvicorn deployment.Is there a disposition for the responses?
 
 Handler path for the Lambda console / IaC config: lambda_handler.handler
 

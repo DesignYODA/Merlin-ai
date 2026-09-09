@@ -120,7 +120,14 @@ export function ProductRequestsPage() {
     return map;
   }, [productRequests]);
 
-  const filtered = productRequests.filter((r) => {
+  // Unfiltered count (unlike `organizers`, which drops falsy aeName) — kept
+  // separate to preserve the stat tile's original semantics exactly.
+  const uniqueOrganizerCount = useMemo(
+    () => new Set(productRequests.map((r) => r.aeName)).size,
+    [productRequests]
+  );
+
+  const filtered = useMemo(() => productRequests.filter((r) => {
     const matchesSearch =
       r.feature.toLowerCase().includes(search.toLowerCase()) ||
       r.clientName.toLowerCase().includes(search.toLowerCase()) ||
@@ -128,7 +135,7 @@ export function ProductRequestsPage() {
       r.callTitle.toLowerCase().includes(search.toLowerCase());
     const matchesOrganizer = selectedOrganizer === "all" || r.aeName === selectedOrganizer;
     return matchesSearch && matchesOrganizer;
-  });
+  }), [productRequests, search, selectedOrganizer]);
 
   const groupedByCall = useMemo(() => {
     const map = new Map<string, { callId: string; callTitle: string; aeName: string; date: string; transcriptUrl: string; summaryBulletGist?: string | null; items: { id: string; feature: string }[] }>();
@@ -207,7 +214,7 @@ export function ProductRequestsPage() {
         </div>
         <div className="bg-app-card border border-[#1e1e2e] rounded-xl p-5">
           <p className="text-emerald-400" style={{ fontSize: "1.5rem", fontWeight: 700 }}>
-            {new Set(productRequests.map((r) => r.aeName)).size}
+            {uniqueOrganizerCount}
           </p>
           <p className="text-[#8888a0]" style={{ fontSize: "0.8rem" }}>Unique Organizers</p>
         </div>

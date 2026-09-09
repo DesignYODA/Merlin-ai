@@ -6,7 +6,7 @@ Included into main.py via app.include_router(router).
 
 import asyncio
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Header
 from config.logging_config import get_logger
 
 logger = get_logger("merlin.api")
@@ -22,6 +22,10 @@ from interface.classes import (
     UpdateSessionBody,
     GenerateTitleBody,
     AskHubspotRowBody,
+    SignupBody,
+    LoginBody,
+    SecurityQuestionBody,
+    ResetPasswordBody,
 )
 from interface.handler import (
     analyze_product_requests,
@@ -61,6 +65,11 @@ from interface.handler import (
     chat_update_session,
     chat_delete_session,
     chat_generate_title,
+    auth_signup,
+    auth_login,
+    auth_get_security_question,
+    auth_reset_password,
+    auth_logout,
 )
 
 router = APIRouter()
@@ -551,3 +560,60 @@ async def chat_sessions_title(session_id: str, body: GenerateTitleBody):
     except Exception as err:
         logger.error("[chat/sessions/title] error for %s: %s", session_id, err)
         raise HTTPException(status_code=500, detail=str(err))
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+@router.post("/auth/signup", tags=["auth"])
+def auth_signup_route(body: SignupBody):
+    try:
+        return auth_signup(
+            email=body.email,
+            username=body.username,
+            password=body.password,
+            securityquestion=body.securityquestion,
+            answer=body.answer,
+        )
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("[auth/signup] error for %s: %s", body.email, err)
+        raise HTTPException(status_code=500, detail=str(err))
+
+
+@router.post("/auth/login", tags=["auth"])
+def auth_login_route(body: LoginBody):
+    try:
+        return auth_login(email=body.email, password=body.password)
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("[auth/login] error for %s: %s", body.email, err)
+        raise HTTPException(status_code=500, detail=str(err))
+
+
+@router.post("/auth/security-question", tags=["auth"])
+def auth_security_question_route(body: SecurityQuestionBody):
+    try:
+        return auth_get_security_question(email=body.email)
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("[auth/security-question] error for %s: %s", body.email, err)
+        raise HTTPException(status_code=500, detail=str(err))
+
+
+@router.post("/auth/reset-password", tags=["auth"])
+def auth_reset_password_route(body: ResetPasswordBody):
+    try:
+        return auth_reset_password(email=body.email, answer=body.answer, new_password=body.new_password)
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("[auth/reset-password] error for %s: %s", body.email, err)
+        raise HTTPException(status_code=500, detail=str(err))
+
+
+@router.post("/auth/logout", tags=["auth"])
+def auth_logout_route(authorization: str | None = Header(default=None)):
+    return auth_logout(authorization)

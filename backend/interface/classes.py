@@ -45,3 +45,22 @@ class GenerateTitleBody(BaseModel):
 class AskHubspotRowBody(BaseModel):
     context: dict = {}
     question: str
+
+class SignupBody(BaseModel):
+    email: str
+    username: str
+    password: str
+    securityquestion: str
+    answer: str
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+class SecurityQuestionBody(BaseModel):
+    email: str
+
+class ResetPasswordBody(BaseModel):
+    email: str
+    answer: str
+    new_password: str

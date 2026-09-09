@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from config.config import SQLITE_PATH, MERLIN_REPLICA_PATH
 
 _TS_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
@@ -26,10 +27,17 @@ def _duration_from_transcript(transcript: str) -> float | None:
 
 os.makedirs(os.path.dirname(os.path.abspath(SQLITE_PATH)), exist_ok=True)
 
-# RLock, not Lock: replica readers hold _lock while calling _get_replica_conn(),
-# which self-heals a missing replica file by calling replicate_to_read_replica() —
-# itself also acquiring _lock. A plain Lock would deadlock the calling thread.
-_lock = threading.RLock()
+# Two separate locks, one per connection object/file. _conn (primary,
+# merlin.sqlite) and _replica_conn (replica, merlin_replica.sqlite) are
+# different connections to different files with no shared state — sharing one
+# lock between them meant every replica read (every frontend-facing GET) waited
+# on primary writes and vice versa, for no reason. RLock (not Lock) on the
+# replica side specifically: a replica reader can self-heal a missing replica
+# file by calling replicate_to_read_replica(), which itself re-acquires
+# _replica_lock for its final swap step — a plain Lock would deadlock the
+# calling thread.
+_lock = threading.RLock()          # guards _conn (primary)
+_replica_lock = threading.RLock()  # guards _replica_conn (replica)
 _conn: sqlite3.Connection | None = None
 
 
@@ -92,6 +100,24 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_meetings_date ON meetings(date DESC);
+
+        CREATE TABLE IF NOT EXISTS auth (
+            emailid           TEXT NOT NULL PRIMARY KEY,
+            password          TEXT NOT NULL,
+            username          TEXT NOT NULL,
+            securityquestion  TEXT NOT NULL,
+            answer            TEXT NOT NULL,
+            lastloggedin      INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token       TEXT NOT NULL PRIMARY KEY,
+            emailid     TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_emailid ON sessions(emailid);
     """)
     conn.commit()
     # Migrations: add columns that didn't exist in earlier schema versions
@@ -182,11 +208,24 @@ def replicate_to_read_replica() -> None:
         src.close()
         dest.close()
 
-    with _lock:
+    with _replica_lock:
         if _replica_conn is not None:
             _replica_conn.close()
             _replica_conn = None
-        os.replace(tmp_path, MERLIN_REPLICA_PATH)
+        # Windows can hold an mmap'd SQLite file's handle open briefly after
+        # .close() returns (the OS unmaps it asynchronously), so an
+        # os.replace() right after can transiently raise PermissionError even
+        # though nothing else in this process still has it open. Retry a few
+        # times with a short backoff rather than letting one bad-timing
+        # replicate() call fail the whole sync.
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, MERLIN_REPLICA_PATH)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
 
 def _get_replica_conn() -> sqlite3.Connection:
@@ -206,7 +245,7 @@ def _get_replica_conn() -> sqlite3.Connection:
 
 def close_replica() -> None:
     global _replica_conn
-    with _lock:
+    with _replica_lock:
         if _replica_conn:
             _replica_conn.close()
             _replica_conn = None
@@ -474,7 +513,7 @@ def get_all_meetings_light_replica() -> list[dict]:
     """Same as get_all_meetings_light() but reads from the read replica file
     instead of the primary — for frontend-facing GET endpoints (list_calls(),
     get_combined_data()) so they never contend with an in-progress sync write."""
-    with _lock:
+    with _replica_lock:
         rows = _get_replica_conn().execute(
             f"SELECT {', '.join(_LIGHT_COLS)} FROM meetings ORDER BY date DESC"
         ).fetchall()
@@ -529,7 +568,6 @@ def upsert_product_insights(results: list[dict]) -> None:
     arr = results if isinstance(results, list) else [results]
     if not arr:
         return
-    import time
     now = int(time.time() * 1000)
     rows = [{**r, "items": json.dumps(r.get("items") or []), "analyzed_at": now} for r in arr]
     with _lock:
@@ -555,7 +593,7 @@ def get_all_product_insights() -> list[dict]:
 def get_all_product_insights_replica() -> list[dict]:
     """Same as get_all_product_insights() but reads from the read replica —
     for the frontend-facing GET /product-insights endpoint."""
-    with _lock:
+    with _replica_lock:
         rows = _get_replica_conn().execute(_PRODUCT_INSIGHTS_QUERY).fetchall()
         return [{**dict(r), "items": json.loads(r["items"] or "[]")} for r in rows]
 
@@ -569,4 +607,75 @@ def delete_product_insights(ids: list[str] | None = None) -> None:
             conn.execute(
                 f"DELETE FROM product_insights WHERE call_id IN ({','.join('?' * len(ids))})", ids
             )
+        conn.commit()
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+def create_auth_user(emailid: str, username: str, password_hash: str, securityquestion: str, answer_hash: str) -> dict:
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO auth (emailid, password, username, securityquestion, answer, lastloggedin)"
+            " VALUES (?, ?, ?, ?, ?, NULL)",
+            (emailid, password_hash, username, securityquestion, answer_hash),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM auth WHERE emailid = ?", (emailid,)).fetchone()
+        return dict(row)
+
+
+def get_auth_user(emailid: str) -> dict | None:
+    with _lock:
+        row = _get_conn().execute("SELECT * FROM auth WHERE emailid = ?", (emailid,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_auth_last_logged_in(emailid: str, ts_ms: int) -> None:
+    with _lock:
+        conn = _get_conn()
+        conn.execute("UPDATE auth SET lastloggedin = ? WHERE emailid = ?", (ts_ms, emailid))
+        conn.commit()
+
+
+def update_auth_password(emailid: str, password_hash: str) -> None:
+    with _lock:
+        conn = _get_conn()
+        conn.execute("UPDATE auth SET password = ? WHERE emailid = ?", (password_hash, emailid))
+        conn.commit()
+
+
+# ─── Sessions ─────────────────────────────────────────────────────────────────
+
+def create_session(token: str, emailid: str, ttl_ms: int) -> dict:
+    now_ms = int(time.time() * 1000)
+    expires_at = now_ms + ttl_ms
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO sessions (token, emailid, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, emailid, now_ms, expires_at),
+        )
+        conn.commit()
+    return {"token": token, "emailid": emailid, "created_at": now_ms, "expires_at": expires_at}
+
+
+def get_session(token: str) -> dict | None:
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute("SELECT * FROM sessions WHERE token = ?", (token,)).fetchone()
+        if row is None:
+            return None
+        session = dict(row)
+        if session["expires_at"] <= int(time.time() * 1000):
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+            return None
+        return session
+
+
+def delete_session(token: str) -> None:
+    with _lock:
+        conn = _get_conn()
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         conn.commit()

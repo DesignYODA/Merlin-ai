@@ -1,7 +1,26 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { useNavigate } from "react-router";
 import { TrendingUp, TrendingDown, Globe, Package, AlertTriangle, Loader2, Megaphone, Users, Handshake, ChevronRight, ExternalLink, X, Search } from "lucide-react";
 import { Line, LineChart, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useData } from "./data-context";
+import { getHubspotFlatData } from "../api";
+import type { HubspotFlatRow } from "./calls-library-page";
+import type { HubspotDealLinkState } from "./library-nav-state";
+
+// Sales stage stat cards — each maps to an exact HubSpot dealstage_label.
+// "Meetings Lost" intentionally maps to the Opportunities pipeline's "Lost"
+// stage (not the Leads pipeline's "Meeting Not Done") per product decision.
+const SALES_STAGE_CARDS: { key: string; label: string; stage: string; color: string }[] = [
+  { key: "churned",         label: "Companies Churned", stage: "Churned",         color: "#f87171" },
+  { key: "contract_signed", label: "Contract Signed",   stage: "Contract Signed", color: "#4ade80" },
+  { key: "meetings_lost",   label: "Meetings Lost",     stage: "Lost",            color: "#fbbf24" },
+  { key: "nurture",         label: "Nurture",           stage: "Nurture",         color: "#60a5fa" },
+];
+
+type DealWithCompany = {
+  deal_id: string; deal_name: string; deal_amount: string; deal_stage: string;
+  deal_closedate: string; deal_pipeline: string; company_id: string; company_name: string;
+};
 
 // Fixed-order categorical palette (identity, never cycled) — reused from the
 // stat-card colors already established elsewhere in this component.
@@ -65,6 +84,7 @@ const TABS: { id: InsightsTab; label: string; icon: typeof Package }[] = [
 ];
 
 export function InsightsPage() {
+  const navigate = useNavigate();
   const { calls, analytics, isLoading, isLive } = useData();
   const { summary, topTopics, topAEs } = analytics;
   const externalCallIds = useMemo(
@@ -77,6 +97,49 @@ export function InsightsPage() {
   const [openKeywordTopic, setOpenKeywordTopic] = useState<string | null>(null);
   const [keywordSearch, setKeywordSearch] = useState("");
 
+  // HubSpot deals — fetched lazily on first visit to the Sales tab, mirroring
+  // calls-library-page.tsx's own fetch-on-first-use pattern for the same data.
+  const [hsRows, setHsRows] = useState<HubspotFlatRow[]>([]);
+  const [hsFetched, setHsFetched] = useState(false);
+  const [hsLoading, setHsLoading] = useState(false);
+  const [hsError, setHsError] = useState<string | null>(null);
+  const [openSalesStage, setOpenSalesStage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (activeTab !== "sales" || hsFetched) return;
+    setHsLoading(true);
+    setHsError(null);
+    getHubspotFlatData()
+      .then((res) => {
+        setHsRows((res.rows || []) as HubspotFlatRow[]);
+        setHsFetched(true);
+      })
+      .catch((err) => setHsError(err instanceof Error ? err.message : "Failed to load HubSpot data"))
+      .finally(() => setHsLoading(false));
+  }, [activeTab, hsFetched]);
+
+  // Every deal across every company, flattened with its parent company attached —
+  // a company can have several deals, each with its own stage, so the stage counts
+  // must be computed over deals (not one stage per company).
+  const allDeals = useMemo<DealWithCompany[]>(
+    () => hsRows.flatMap((r) =>
+      (r.all_deals || []).map((d) => ({ ...d, company_id: r.company_id, company_name: r.company_name }))
+    ),
+    [hsRows]
+  );
+
+  // Grouped once so the 4 sales stat cards (and the modal) don't each re-filter
+  // the full deal list on every render — was O(allDeals) × 4 per render before.
+  const dealsByStage = useMemo(() => {
+    const map = new Map<string, DealWithCompany[]>();
+    for (const d of allDeals) {
+      const list = map.get(d.deal_stage);
+      if (list) list.push(d);
+      else map.set(d.deal_stage, [d]);
+    }
+    return map;
+  }, [allDeals]);
+
   const toggleKeyword = (topic: string) => {
     setExcludedKeywords((prev) => {
       const next = new Set(prev);
@@ -88,6 +151,76 @@ export function InsightsPage() {
 
   const totalCalls = summary?.totalCalls ?? 0;
 
+  const statCards = useMemo(() => [
+    { label: "Top Keyword",    value: topTopics[0]?.topic ?? "N/A",                                                                    sub: topTopics[0] ? `${topTopics[0].count} mentions` : "",     icon: TrendingUp,    color: "#ec5d25" },
+    { label: "Most Active AE", value: topAEs[0]?.aeName ?? "N/A",                                                                      sub: topAEs[0] ? `${topAEs[0].callCount} calls` : "",          icon: Globe,         color: "#4ade80" },
+    { label: "Action Items",   value: String(summary?.totalActionItems ?? 0),                                                           sub: `from ${totalCalls} calls`,                               icon: Package,       color: "#fbbf24" },
+    { label: "Sentiment",      value: `${summary?.positiveSentiment ?? 0} / ${summary?.negativeSentiment ?? 0}`,                        sub: "positive / negative",                                    icon: AlertTriangle, color: "#f87171" },
+  ], [topTopics, topAEs, summary, totalCalls]);
+
+  // The Product tab's whole trend pipeline (filter → month-bucket every call
+  // date → build chart series) — previously recomputed on every render while
+  // that tab was visible instead of only when the underlying data changed.
+  const productTrend = useMemo(() => {
+    const trending = groupedTopics.filter((t) => t.count > 5).sort((a, b) => b.count - a.count);
+    if (trending.length === 0) {
+      return { trending, maxCount: 1, months: [] as string[], chartData: [] as Record<string, string | number>[], lastTotal: 0, delta: 0, trendingUp: true };
+    }
+
+    const maxCount = Math.max(...trending.map((t) => t.count), 1);
+
+    const callDateMap = new Map(calls.map((c) => [c.id, c.dateTimestamp]));
+    const monthSet = new Set<string>();
+    trending.forEach((t) => t.callIds.forEach((id) => {
+      const ts = callDateMap.get(id);
+      if (ts) monthSet.add(monthKey(ts));
+    }));
+    const months = [...monthSet].sort();
+
+    const countInMonth = (callIds: string[], mk: string) =>
+      callIds.filter((id) => {
+        const ts = callDateMap.get(id);
+        return ts !== undefined && monthKey(ts) === mk;
+      }).length;
+
+    const chartData = months.map((mk) => {
+      const row: Record<string, string | number> = { month: monthLabel(mk) };
+      trending.forEach((t) => { row[t.topic] = countInMonth(t.callIds, mk); });
+      return row;
+    });
+
+    const monthTotals = months.map((mk) =>
+      trending.reduce((sum, t) => sum + countInMonth(t.callIds, mk), 0)
+    );
+    const lastTotal = monthTotals[monthTotals.length - 1] ?? 0;
+    const prevTotal = monthTotals[monthTotals.length - 2] ?? 0;
+    const delta = prevTotal > 0 ? Math.round(((lastTotal - prevTotal) / prevTotal) * 100) : (lastTotal > 0 ? 100 : 0);
+    const trendingUp = delta >= 0;
+
+    return { trending, maxCount, months, chartData, lastTotal, delta, trendingUp };
+  }, [groupedTopics, calls]);
+
+  // Calls matching the currently-open keyword modal — was calls.find() per
+  // callId (O(callIds × calls)) recomputed on every render while the modal
+  // was open; a Map lookup plus computing it only when the topic changes fixes both.
+  const matchedKeywordCalls = useMemo(() => {
+    const topic = groupedTopics.find((t) => t.topic === openKeywordTopic);
+    if (!topic) return [];
+    const callsById = new Map(calls.map((c) => [c.id, c]));
+    return topic.callIds
+      .map((id) => callsById.get(id))
+      .filter((c): c is NonNullable<typeof c> => Boolean(c))
+      .sort((a, b) => (b.dateTimestamp || 0) - (a.dateTimestamp || 0));
+  }, [groupedTopics, openKeywordTopic, calls]);
+
+  // Deals for the currently-open sales stage modal, sorted — reuses the
+  // dealsByStage grouping above instead of re-filtering allDeals.
+  const sortedStageDeals = useMemo(() => {
+    const card = SALES_STAGE_CARDS.find((c) => c.key === openSalesStage);
+    const list = card ? (dealsByStage.get(card.stage) || []) : [];
+    return [...list].sort((a, b) => (b.deal_closedate || "").localeCompare(a.deal_closedate || ""));
+  }, [dealsByStage, openSalesStage]);
+
   if (isLoading) {
     return (
       <div className="h-full bg-dash-dark flex items-center justify-center">
@@ -98,13 +231,6 @@ export function InsightsPage() {
       </div>
     );
   }
-
-  const statCards = [
-    { label: "Top Keyword",    value: topTopics[0]?.topic ?? "N/A",                                                                    sub: topTopics[0] ? `${topTopics[0].count} mentions` : "",     icon: TrendingUp,    color: "#ec5d25" },
-    { label: "Most Active AE", value: topAEs[0]?.aeName ?? "N/A",                                                                      sub: topAEs[0] ? `${topAEs[0].callCount} calls` : "",          icon: Globe,         color: "#4ade80" },
-    { label: "Action Items",   value: String(summary?.totalActionItems ?? 0),                                                           sub: `from ${totalCalls} calls`,                               icon: Package,       color: "#fbbf24" },
-    { label: "Sentiment",      value: `${summary?.positiveSentiment ?? 0} / ${summary?.negativeSentiment ?? 0}`,                        sub: "positive / negative",                                    icon: AlertTriangle, color: "#f87171" },
-  ];
 
   return (
     <div className="h-full bg-dash-dark overflow-y-auto" style={{ paddingTop: 64 }}>
@@ -164,9 +290,7 @@ export function InsightsPage() {
 
           {/* Tab content */}
           {activeTab === "product" && (() => {
-            const trending = groupedTopics
-              .filter((t) => t.count > 5)
-              .sort((a, b) => b.count - a.count);
+            const { trending, maxCount, months, chartData, lastTotal, delta, trendingUp } = productTrend;
 
             if (trending.length === 0) {
               return (
@@ -176,37 +300,6 @@ export function InsightsPage() {
                 </div>
               );
             }
-
-            const maxCount = Math.max(...trending.map((t) => t.count), 1);
-
-            // Cross-reference each topic's callIds against call dates to bucket mentions by month
-            const callDateMap = new Map(calls.map((c) => [c.id, c.dateTimestamp]));
-            const monthSet = new Set<string>();
-            trending.forEach((t) => t.callIds.forEach((id) => {
-              const ts = callDateMap.get(id);
-              if (ts) monthSet.add(monthKey(ts));
-            }));
-            const months = [...monthSet].sort();
-
-            const countInMonth = (callIds: string[], mk: string) =>
-              callIds.filter((id) => {
-                const ts = callDateMap.get(id);
-                return ts !== undefined && monthKey(ts) === mk;
-              }).length;
-
-            const chartData = months.map((mk) => {
-              const row: Record<string, string | number> = { month: monthLabel(mk) };
-              trending.forEach((t) => { row[t.topic] = countInMonth(t.callIds, mk); });
-              return row;
-            });
-
-            const monthTotals = months.map((mk) =>
-              trending.reduce((sum, t) => sum + countInMonth(t.callIds, mk), 0)
-            );
-            const lastTotal = monthTotals[monthTotals.length - 1] ?? 0;
-            const prevTotal = monthTotals[monthTotals.length - 2] ?? 0;
-            const delta = prevTotal > 0 ? Math.round(((lastTotal - prevTotal) / prevTotal) * 100) : (lastTotal > 0 ? 100 : 0);
-            const trendingUp = delta >= 0;
 
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--card-gap)' }}>
@@ -405,7 +498,57 @@ export function InsightsPage() {
             );
           })()}
 
-          {activeTab !== "product" && TABS.filter((t) => t.id === activeTab).map((tab) => (
+          {activeTab === "sales" && (() => {
+            if (hsLoading && !hsFetched) {
+              return (
+                <div className="flex items-center justify-center gap-2" style={{ padding: 48, minHeight: 260 }}>
+                  <Loader2 className="animate-spin" style={{ width: 20, height: 20, color: '#ec5d25' }} />
+                  <p style={{ fontSize: 'var(--fs-small)', color: 'var(--card-label)' }}>Loading HubSpot deals…</p>
+                </div>
+              );
+            }
+            if (hsError) {
+              return (
+                <div className="flex flex-col items-center justify-center" style={{ padding: 48, minHeight: 260 }}>
+                  <AlertTriangle style={{ width: 28, height: 28, color: '#f87171', marginBottom: 8 }} />
+                  <p style={{ fontSize: 'var(--fs-small)', color: '#f87171' }}>{hsError}</p>
+                </div>
+              );
+            }
+            return (
+              <div className="grid grid-cols-4 gap-[var(--card-gap)]">
+                {SALES_STAGE_CARDS.map((card) => {
+                  const matches = dealsByStage.get(card.stage) || [];
+                  return (
+                    <button
+                      key={card.key}
+                      onClick={() => setOpenSalesStage(card.key)}
+                      className="border flex flex-col transition-opacity hover:opacity-90"
+                      style={{
+                        background: 'var(--card-bg)', borderRadius: 'var(--card-r)', padding: 'var(--card-inner)',
+                        borderColor: 'var(--dash-card-border)', textAlign: 'left', cursor: 'pointer',
+                      }}
+                    >
+                      <div className="flex items-center justify-between" style={{ marginBottom: 8 }}>
+                        <span style={{ fontSize: 'var(--fs-tiny)', color: 'var(--card-label)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>
+                          {card.label}
+                        </span>
+                        <ChevronRight style={{ width: 14, height: 14, color: 'var(--card-subtle)', flexShrink: 0 }} />
+                      </div>
+                      <p style={{ fontSize: 'var(--fs-stat)', fontWeight: 700, color: card.color, lineHeight: 1 }}>
+                        {matches.length}
+                      </p>
+                      <p style={{ fontSize: 'var(--fs-tiny)', color: 'var(--card-subtle)', marginTop: 4 }}>
+                        deal{matches.length !== 1 ? "s" : ""}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })()}
+
+          {activeTab !== "product" && activeTab !== "sales" && TABS.filter((t) => t.id === activeTab).map((tab) => (
             <div key={tab.id} className="flex flex-col items-center justify-center"
                  style={{ padding: 48, minHeight: 260 }}>
               <tab.icon style={{ width: 28, height: 28, color: 'var(--card-subtle)', marginBottom: 8 }} />
@@ -418,11 +561,7 @@ export function InsightsPage() {
 
       {/* ── Keyword calls modal ── */}
       {openKeywordTopic && (() => {
-        const topic = groupedTopics.find((t) => t.topic === openKeywordTopic);
-        const matchedCalls = (topic?.callIds ?? [])
-          .map((id) => calls.find((c) => c.id === id))
-          .filter((c): c is NonNullable<typeof c> => Boolean(c))
-          .sort((a, b) => (b.dateTimestamp || 0) - (a.dateTimestamp || 0));
+        const matchedCalls = matchedKeywordCalls;
 
         return (
           <div
@@ -478,6 +617,80 @@ export function InsightsPage() {
                       </Row>
                     );
                   })
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── Sales stage deals modal ── */}
+      {openSalesStage && (() => {
+        const card = SALES_STAGE_CARDS.find((c) => c.key === openSalesStage);
+        const matchedDeals = sortedStageDeals;
+
+        return (
+          <div
+            className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center"
+            style={{ animation: "fadeInOverlay 0.2s ease-out", padding: 24 }}
+            onClick={() => setOpenSalesStage(null)}
+          >
+            <div
+              className="border w-full"
+              style={{
+                maxWidth: 520, maxHeight: '70vh', display: 'flex', flexDirection: 'column',
+                background: 'var(--card-bg)', borderColor: 'var(--dash-card-border)', borderRadius: 'var(--card-r)',
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-start justify-between border-b shrink-0" style={{ padding: 'var(--card-inner)', borderColor: 'var(--dash-card-border)' }}>
+                <div>
+                  <p style={{ fontSize: 'var(--fs-small)', fontWeight: 700, color: 'var(--dash-card-text)' }}>{card?.label}</p>
+                  <p style={{ fontSize: 'var(--fs-tiny)', color: 'var(--card-subtle)', marginTop: 2 }}>
+                    {matchedDeals.length} deal{matchedDeals.length !== 1 ? "s" : ""} in stage "{card?.stage}"
+                  </p>
+                </div>
+                <button
+                  onClick={() => setOpenSalesStage(null)}
+                  className="flex items-center justify-center border transition-all hover:text-white shrink-0"
+                  style={{ width: 28, height: 28, borderRadius: 'var(--card-r)', background: 'var(--card-bg)', borderColor: 'var(--dash-card-border)', color: 'var(--card-label)' }}
+                >
+                  <X style={{ width: 13, height: 13 }} />
+                </button>
+              </div>
+
+              <div style={{ overflowY: 'auto', padding: 8 }}>
+                {matchedDeals.length === 0 ? (
+                  <p style={{ fontSize: 'var(--fs-small)', color: 'var(--card-subtle)', padding: 16 }}>No deals found in this stage.</p>
+                ) : (
+                  matchedDeals.map((deal) => (
+                    <button
+                      key={deal.deal_id}
+                      onClick={() => navigate("/library", {
+                        state: { hubspotCompanyId: deal.company_id, hubspotDealId: deal.deal_id } satisfies HubspotDealLinkState,
+                      })}
+                      className="w-full flex items-center gap-3 transition-colors hover:bg-dash-card-hover"
+                      style={{ padding: '10px 12px', borderRadius: 'var(--card-r)', textAlign: 'left', cursor: 'pointer' }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <p className="truncate" style={{ fontSize: 'var(--fs-small)', fontWeight: 600, color: 'var(--dash-card-text)' }}>
+                          {deal.deal_name || deal.company_name || "Unnamed deal"}
+                        </p>
+                        <p style={{ fontSize: 'var(--fs-tiny)', color: 'var(--card-subtle)', marginTop: 2 }}>
+                          {deal.company_name}{deal.deal_amount ? ` · $${deal.deal_amount}` : ""}{deal.deal_closedate ? ` · ${deal.deal_closedate.slice(0, 10)}` : ""}
+                        </p>
+                      </div>
+                      {deal.deal_pipeline && (
+                        <span style={{
+                          fontSize: 'var(--fs-tiny)', fontWeight: 600, padding: '3px 9px', borderRadius: 9999,
+                          background: `${card?.color}1a`, color: card?.color, flexShrink: 0,
+                        }}>
+                          {deal.deal_pipeline}
+                        </span>
+                      )}
+                      <ChevronRight style={{ width: 13, height: 13, color: 'var(--card-subtle)', flexShrink: 0 }} />
+                    </button>
+                  ))
                 )}
               </div>
             </div>

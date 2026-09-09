@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import * as d3 from "d3";
 import { Search, Loader2 } from "lucide-react";
 import { useData } from "./data-context";
@@ -459,26 +459,32 @@ export function TopicsPage() {
 
   const searchLower = search.toLowerCase();
 
-  const categorized = topTopics.map((t) => ({
-    ...t,
-    category: categorize(t.topic),
-  }));
+  // categorize() scans every topic against both keyword lists — recomputing
+  // it on every render (e.g. every keystroke elsewhere, every selectedTopic
+  // change) was O(topics × keywords) for no reason once topTopics is stable.
+  const categorized = useMemo(
+    () => topTopics.map((t) => ({ ...t, category: categorize(t.topic) })),
+    [topTopics]
+  );
 
-  const forCategory = (cat: Category) =>
-    categorized.filter(
-      (t) =>
-        t.category === cat && t.topic.toLowerCase().includes(searchLower)
-    );
+  const { industryTopics, productTopics, otherTopics } = useMemo(() => {
+    const forCategory = (cat: Category) =>
+      categorized.filter(
+        (t) => t.category === cat && t.topic.toLowerCase().includes(searchLower)
+      );
+    return {
+      industryTopics: forCategory("industry"),
+      productTopics: forCategory("product"),
+      otherTopics: forCategory("other"),
+    };
+  }, [categorized, searchLower]);
 
-  const industryTopics = forCategory("industry");
-  const productTopics = forCategory("product");
-  const otherTopics = forCategory("other");
-
-  const selectedTopicCalls = selectedTopic
-    ? calls.filter((c) =>
-        c.topics.some((t) => t.toLowerCase() === selectedTopic.toLowerCase())
-      )
-    : [];
+  const selectedTopicCalls = useMemo(
+    () => selectedTopic
+      ? calls.filter((c) => c.topics.some((t) => t.toLowerCase() === selectedTopic.toLowerCase()))
+      : [],
+    [calls, selectedTopic]
+  );
 
   if (isLoading) {
     return (

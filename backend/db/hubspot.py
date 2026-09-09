@@ -27,10 +27,17 @@ HUBSPOT_DB_PATH = os.environ.get("HUBSPOT_PATH", os.path.join(_DATA_DIR, "hubspo
 
 os.makedirs(os.path.dirname(os.path.abspath(HUBSPOT_DB_PATH)), exist_ok=True)
 
-# RLock, not Lock: replica readers hold _lock while calling _get_replica_conn(),
-# which self-heals a missing replica file by calling replicate_to_read_replica() —
-# itself also acquiring _lock. A plain Lock would deadlock the calling thread.
-_lock = threading.RLock()
+# Two separate locks, one per connection object/file. _conn (primary,
+# hubspot_data.sqlite) and _replica_conn (replica, hubspot_data_replica.sqlite)
+# are different connections to different files with no shared state — sharing
+# one lock between them meant every replica read (every /hubspot/* GET) waited
+# on primary writes and vice versa, for no reason. RLock (not Lock) on the
+# replica side specifically: a replica reader can self-heal a missing replica
+# file by calling replicate_to_read_replica(), which itself re-acquires
+# _replica_lock for its final swap step — a plain Lock would deadlock the
+# calling thread.
+_lock = threading.RLock()          # guards _conn (primary)
+_replica_lock = threading.RLock()  # guards _replica_conn (replica)
 _conn: sqlite3.Connection | None = None
 
 
@@ -260,11 +267,24 @@ def replicate_to_read_replica() -> None:
         src.close()
         dest.close()
 
-    with _lock:
+    with _replica_lock:
         if _replica_conn is not None:
             _replica_conn.close()
             _replica_conn = None
-        os.replace(tmp_path, HUBSPOT_REPLICA_PATH)
+        # Windows can hold an mmap'd SQLite file's handle open briefly after
+        # .close() returns (the OS unmaps it asynchronously), so an
+        # os.replace() right after can transiently raise PermissionError even
+        # though nothing else in this process still has it open. Retry a few
+        # times with a short backoff rather than letting one bad-timing
+        # replicate() call fail the whole sync.
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, HUBSPOT_REPLICA_PATH)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
 
 def _get_replica_conn() -> sqlite3.Connection:
@@ -284,7 +304,7 @@ def _get_replica_conn() -> sqlite3.Connection:
 
 def close_hubspot_replica() -> None:
     global _replica_conn
-    with _lock:
+    with _replica_lock:
         if _replica_conn:
             _replica_conn.close()
             _replica_conn = None
@@ -524,7 +544,7 @@ def get_hubspot_db_entities() -> dict:
     """Return {companies, deals, notes, emails, contacts} shaped for the frontend
     (same as enriched API shape). Reads from the read replica — this is purely
     a frontend-facing GET path, never used by any write flow."""
-    with _lock:
+    with _replica_lock:
         conn  = _get_replica_conn()
         cos   = [dict(r) for r in conn.execute("SELECT * FROM companies ORDER BY name").fetchall()]
         deals = [dict(r) for r in conn.execute("SELECT * FROM deals ORDER BY dealname").fetchall()]
@@ -594,7 +614,7 @@ def get_hubspot_flat_data() -> list[dict]:
     modal is opened. Reads from the read replica — purely a frontend-facing
     GET path, never used by any write flow.
     """
-    with _lock:
+    with _replica_lock:
         conn = _get_replica_conn()
         cos  = [dict(r) for r in conn.execute("SELECT * FROM companies ORDER BY name").fetchall()]
 
@@ -755,7 +775,7 @@ def get_hubspot_company_details(company_id: str) -> dict:
     get_hubspot_flat_data(), which intentionally omits this per-company detail
     for every company at once. Reads from the read replica.
     """
-    with _lock:
+    with _replica_lock:
         conn = _get_replica_conn()
         notes = [dict(r) for r in conn.execute(
             "SELECT * FROM notes WHERE company_id = ? ORDER BY hs_createdate DESC", (company_id,)

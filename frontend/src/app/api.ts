@@ -1,5 +1,32 @@
 const BASE = import.meta.env.VITE_SQLITE_SERVER_BASE ?? "http://localhost:3001";
 
+// ─── Session token ────────────────────────────────────────────────────────────
+
+export const AUTH_TOKEN_KEY = "glisseo_auth_token";
+const AUTH_EMAIL_KEY = "glisseo_auth_email";
+
+function getStoredToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+// Any 401 means the session is missing/expired server-side — clear the stale
+// client state and force back to the login screen instead of letting callers
+// (e.g. data-context.tsx's 5-min sync loop) degrade into a silent, permanent
+// "Offline Mode" with no prompt to re-authenticate. Skipped for /auth/* paths
+// so the login page's own inline "invalid credentials" handling isn't hijacked.
+function _handleUnauthorized(path: string) {
+  if (path.startsWith("/auth/")) return;
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_EMAIL_KEY);
+  } catch { /* ignore */ }
+  window.location.assign("/login");
+}
+
 // ─── Core fetch (retries + timeout) ──────────────────────────────────────────
 
 export async function apiFetch<T = unknown>(
@@ -26,10 +53,15 @@ export async function apiFetch<T = unknown>(
     );
     try {
       const { timeoutMs: _, ...fetchOptions } = options ?? {};
+      const token = getStoredToken();
       const res = await fetch(`${BASE}${path}`, {
         ...fetchOptions,
         signal: controller.signal,
-        headers: { "Content-Type": "application/json", ...(fetchOptions?.headers ?? {}) },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(fetchOptions?.headers ?? {}),
+        },
       });
       if (!res.ok) {
         const bodyText = await res.text();
@@ -37,6 +69,9 @@ export async function apiFetch<T = unknown>(
           console.warn(`546 WORKER_LIMIT on ${path}, retry ${attempt + 1}/${maxRetries}`);
           await _backoff(attempt);
           continue;
+        }
+        if (res.status === 401) {
+          _handleUnauthorized(path);
         }
         // FastAPI's HTTPException wraps the real message as {"detail": "..."}
         // — surface just that instead of dumping the raw JSON envelope into
@@ -394,18 +429,71 @@ export interface StreamCallbacks {
   onError?: (err: Error) => void;
 }
 
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+export interface AuthUser {
+  email: string;
+  username: string;
+  securityquestion: string;
+  lastloggedin: number | null;
+}
+
+export const authSignup = (params: {
+  email: string;
+  username: string;
+  password: string;
+  securityquestion: string;
+  answer: string;
+}) =>
+  apiFetch<AuthUser>("/auth/signup", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+
+export interface AuthLoginResult extends AuthUser {
+  token: string;
+}
+
+export const authLogin = (email: string, password: string) =>
+  apiFetch<AuthLoginResult>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+
+export const authGetSecurityQuestion = (email: string) =>
+  apiFetch<{ securityquestion: string }>("/auth/security-question", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+
+export const authResetPassword = (params: { email: string; answer: string; new_password: string }) =>
+  apiFetch<{ success: boolean }>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+
+export const authLogout = () =>
+  apiFetch<{ success: boolean }>("/auth/logout", { method: "POST" });
+
 export async function streamFinalResponse(
   body: { resultData: unknown; parsedQuery?: unknown; formattedIntro?: string },
   { onToken, onDone, onError }: StreamCallbacks
 ): Promise<void> {
   let res: Response;
   try {
+    const token = getStoredToken();
     res = await fetch(`${BASE}/final-response`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`Server error ${res.status}`);
+    if (!res.ok) {
+      if (res.status === 401) _handleUnauthorized("/final-response");
+      throw new Error(`Server error ${res.status}`);
+    }
   } catch (err) {
     onError?.(err as Error);
     return;

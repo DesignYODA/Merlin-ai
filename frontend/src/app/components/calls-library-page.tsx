@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useLocation } from "react-router";
 import parse from "html-react-parser";
 import { Search, Filter, X, ChevronRight, Clock, Users, ExternalLink, Loader2, Play, Check, Building2, Handshake, RefreshCw, Send, Sparkles, ArrowUp, ArrowDown, ArrowUpDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { useData, type NormalizedCall } from "./data-context";
 import { getHubspotFlatData, getHubspotCompanyDetails, backfillHubspotLabels, askCall, askHubspotRow } from "../api";
 import type { AskAiSeedItem } from "./ask-ai-page";
+import type { HubspotDealLinkState } from "./library-nav-state";
 
-interface HubspotFlatRow {
+export interface HubspotFlatRow {
   company_id: string; company_name: string; company_domain: string; company_phone: string;
   company_city: string; company_state: string; company_country: string; company_industry: string;
   company_createdate: string; company_lifecyclestage: string; company_hubspot_owner_id: string;
@@ -677,6 +678,7 @@ function ChecklistFilter({
 
 export function CallsLibraryPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { calls, isLoading, isLive, refresh, getCallDetail } = useData();
   const [search, setSearch] = useState("");
   const [selectedCall, setSelectedCall] = useState<NormalizedCall | null>(null);
@@ -713,6 +715,11 @@ export function CallsLibraryPage() {
   const [hsError, setHsError] = useState<string | null>(null);
   const [hsFetched, setHsFetched] = useState(false);
   const [selectedHsRow, setSelectedHsRow] = useState<HubspotFlatRow | null>(null);
+  // Deep-link target when arriving via a "view deal" navigation (e.g. from
+  // Insights' Sales stage modal) — highlights the specific deal within the
+  // opened company's Deals section.
+  const [highlightDealId, setHighlightDealId] = useState<string | null>(null);
+  const highlightDealRef = useRef<HTMLDivElement>(null);
   const [hsVisibleCount, setHsVisibleCount] = useState(50);
   const [hsSortDir, setHsSortDir] = useState<"asc" | "desc">("desc");
   const [hsCountryFilters, setHsCountryFilters] = useState<string[]>([]);
@@ -748,6 +755,32 @@ export function CallsLibraryPage() {
       .catch((err) => setHsError(err instanceof Error ? err.message : "Failed to load HubSpot data"))
       .finally(() => setHsLoading(false));
   }, [source, hsFetched]);
+
+  // Deep-link handling: a caller (e.g. Insights' Sales stage modal) navigated
+  // here with { hubspotCompanyId, hubspotDealId? } in location.state. Switch
+  // to the HubSpot tab immediately so the fetch effect above kicks off, then
+  // once hsData has actually loaded, open that company's modal and highlight
+  // the deal. The state is cleared via a replace navigation once handled (or
+  // once we've established the company can't be found) so it doesn't re-fire.
+  useEffect(() => {
+    const navState = location.state as HubspotDealLinkState | null;
+    if (!navState?.hubspotCompanyId) return;
+    setSource("hubspot");
+    if (!hsFetched) return;
+    const row = hsData.find((r) => r.company_id === navState.hubspotCompanyId);
+    if (row) {
+      setSelectedHsRow(row);
+      setHighlightDealId(navState.hubspotDealId ?? null);
+    }
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, hsFetched, hsData, navigate]);
+
+  // Scroll the highlighted deal into view once, when the modal opens with a target.
+  useEffect(() => {
+    if (highlightDealId && selectedHsRow) {
+      highlightDealRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [highlightDealId, selectedHsRow]);
 
   const [hsBackfilling, setHsBackfilling] = useState(false);
   const refreshHubspot = () => { setHsFetched(false); };
@@ -1005,8 +1038,15 @@ export function CallsLibraryPage() {
           <h1 className="text-white" style={{ fontSize: '2.6rem' }}>Calls Library</h1>
         </div>
 
-        {/* Single unified block: search + filters + table */}
-        <div className="border overflow-hidden" style={{ background: 'var(--card-bg)', borderRadius: 'var(--card-r)', borderColor: 'var(--dash-card-border)' }}>
+        {/* Single unified block: search + filters + table.
+            NOT overflow-hidden here — the Filter dropdown is an absolutely-positioned
+            popover anchored inside the toolbar below, and overflow:hidden on this
+            outer box would permanently clip it (with no way to scroll it back into
+            view) whenever the table is short enough that the block's total height
+            is less than the dropdown's own height — i.e. exactly when there are few
+            rows. Rounding is instead clipped per-table-wrapper below, scoped to just
+            the table content, so it doesn't also clip the toolbar's popovers. */}
+        <div className="border" style={{ background: 'var(--card-bg)', borderRadius: 'var(--card-r)', borderColor: 'var(--dash-card-border)' }}>
 
           {/* Toolbar */}
           <div className="flex items-center gap-3 flex-wrap border-b" style={{ padding: '12px 16px', borderColor: 'var(--dash-card-border)' }}>
@@ -1422,7 +1462,7 @@ export function CallsLibraryPage() {
 
           {/* ── HubSpot unified table ── */}
           {source === "hubspot" && (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" style={{ overflowY: 'hidden', borderBottomLeftRadius: 'var(--card-r)', borderBottomRightRadius: 'var(--card-r)' }}>
               {hsLoading && (
                 <div className="flex items-center justify-center gap-2" style={{ padding: 48, color: 'var(--card-label)', fontSize: 'var(--fs-small)' }}>
                   <Loader2 className="w-4 h-4 animate-spin" style={{ color: '#ec5d25' }} /> Loading HubSpot data…
@@ -1467,7 +1507,7 @@ export function CallsLibraryPage() {
                       </td></tr>
                     ) : visibleHsData.map((row) => (
                       <tr key={row.company_id} className="group border-b last:border-b-0 cursor-pointer transition-colors hover:bg-dash-card-hover" style={{ borderColor: 'var(--dash-divider)' }}
-                          onClick={() => setSelectedHsRow(row)}>
+                          onClick={() => { setSelectedHsRow(row); setHighlightDealId(null); }}>
                         <td style={{ padding: '11px 8px 11px 16px', width: 32 }} onClick={(e) => e.stopPropagation()}>
                           <input
                             type="checkbox"
@@ -1579,7 +1619,7 @@ export function CallsLibraryPage() {
           )}
 
           {/* ── Fireflies table ── */}
-          {source === "fireflies" && <div className="overflow-x-auto">
+          {source === "fireflies" && <div className="overflow-x-auto" style={{ overflowY: 'hidden', borderBottomLeftRadius: 'var(--card-r)', borderBottomRightRadius: 'var(--card-r)' }}>
             <table className="w-full">
               <thead>
                 <tr className="border-b">
@@ -1716,7 +1756,7 @@ export function CallsLibraryPage() {
         <div
           className="fixed inset-0 bg-black/70 z-50 flex justify-end"
           style={{ animation: "fadeInOverlay 0.2s ease-out" }}
-          onClick={() => setSelectedHsRow(null)}
+          onClick={() => { setSelectedHsRow(null); setHighlightDealId(null); }}
         >
           <div
             className="w-full max-w-2xl h-full border-l flex flex-col"
@@ -1742,7 +1782,7 @@ export function CallsLibraryPage() {
                 )}
               </div>
               <button
-                onClick={() => setSelectedHsRow(null)}
+                onClick={() => { setSelectedHsRow(null); setHighlightDealId(null); }}
                 className="flex items-center justify-center border transition-all hover:text-white shrink-0"
                 style={{ width: 32, height: 32, borderRadius: 'var(--card-r)', background: 'var(--card-bg)', borderColor: 'var(--dash-card-border)', color: 'var(--card-label)' }}
               >
@@ -1805,8 +1845,20 @@ export function CallsLibraryPage() {
                     Deals ({(selectedHsRow.all_deals || []).length})
                   </p>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {(selectedHsRow.all_deals || []).map((d) => (
-                      <div key={d.deal_id} className="border" style={{ borderRadius: 'var(--card-r)', borderColor: 'var(--dash-divider)', padding: '10px 14px', display: 'flex', flexWrap: 'wrap', gap: '6px 20px', alignItems: 'center' }}>
+                    {(selectedHsRow.all_deals || []).map((d) => {
+                      const isHighlighted = highlightDealId !== null && d.deal_id === highlightDealId;
+                      return (
+                      <div
+                        key={d.deal_id}
+                        ref={isHighlighted ? highlightDealRef : undefined}
+                        className="border"
+                        style={{
+                          borderRadius: 'var(--card-r)', padding: '10px 14px', display: 'flex', flexWrap: 'wrap', gap: '6px 20px', alignItems: 'center',
+                          borderColor: isHighlighted ? '#ec5d25' : 'var(--dash-divider)',
+                          background: isHighlighted ? 'rgba(236,93,37,0.08)' : 'transparent',
+                          boxShadow: isHighlighted ? '0 0 0 1px #ec5d25' : 'none',
+                        }}
+                      >
                         <span style={{ fontSize: 'var(--fs-medium)', fontWeight: 600, color: 'var(--dash-card-text)', flexGrow: 1 }}>{d.deal_name || "Unnamed Deal"}</span>
                         {d.deal_amount && <span style={{ fontSize: 'var(--fs-small)', color: '#4ade80', fontWeight: 600 }}>${Number(d.deal_amount).toLocaleString()}</span>}
                         {d.deal_stage && <span style={{ fontSize: 'var(--fs-tiny)', padding: '2px 8px', borderRadius: 9999, background: 'rgba(139,92,246,0.12)', color: '#a78bfa' }}>{d.deal_stage}</span>}
@@ -1823,7 +1875,8 @@ export function CallsLibraryPage() {
                           </a>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </section>
               )}
