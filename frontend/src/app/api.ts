@@ -435,7 +435,9 @@ export interface AuthUser {
   email: string;
   username: string;
   securityquestion: string;
+  title: string;
   lastloggedin: number | null;
+  role: "admin" | "member";
 }
 
 export const authSignup = (params: {
@@ -444,6 +446,8 @@ export const authSignup = (params: {
   password: string;
   securityquestion: string;
   answer: string;
+  title: string;
+  role: "admin" | "member";
 }) =>
   apiFetch<AuthUser>("/auth/signup", {
     method: "POST",

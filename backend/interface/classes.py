@@ -52,6 +52,8 @@ class SignupBody(BaseModel):
     password: str
     securityquestion: str
     answer: str
+    title: str = ""
+    role: str = "member"
 
 class LoginBody(BaseModel):
     email: str

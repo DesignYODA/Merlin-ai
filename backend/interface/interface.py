@@ -573,6 +573,8 @@ def auth_signup_route(body: SignupBody):
             password=body.password,
             securityquestion=body.securityquestion,
             answer=body.answer,
+            title=body.title,
+            role=body.role,
         )
     except HTTPException:
         raise

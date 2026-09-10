@@ -1298,15 +1298,22 @@ def _public_auth_user(user: dict) -> dict:
         "email": user["emailid"],
         "username": user["username"],
         "securityquestion": user["securityquestion"],
+        "title": user.get("title") or "",
         "lastloggedin": user.get("lastloggedin"),
+        "role": user.get("role") or "member",
     }
 
 
-def auth_signup(email: str, username: str, password: str, securityquestion: str, answer: str) -> dict:
+_VALID_ROLES = {"admin", "member"}
+
+
+def auth_signup(email: str, username: str, password: str, securityquestion: str, answer: str, title: str = "", role: str = "member") -> dict:
     email = (email or "").strip().lower()
     username = (username or "").strip()
     securityquestion = (securityquestion or "").strip()
     answer = (answer or "").strip()
+    title = (title or "").strip()
+    role = (role or "member").strip().lower()
 
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email is required")
@@ -1316,6 +1323,8 @@ def auth_signup(email: str, username: str, password: str, securityquestion: str,
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     if not securityquestion or not answer:
         raise HTTPException(status_code=400, detail="Security question and answer are required")
+    if role not in _VALID_ROLES:
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'member'")
     if _get_auth_user(email):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
@@ -1325,8 +1334,10 @@ def auth_signup(email: str, username: str, password: str, securityquestion: str,
         password_hash=hash_secret(password),
         securityquestion=securityquestion,
         answer_hash=hash_secret(answer.lower()),
+        title=title,
+        role=role,
     )
-    logger.info("[auth] signup for %s", email)
+    logger.info("[auth] signup for %s (role=%s)", email, role)
     return _public_auth_user(user)
 
 

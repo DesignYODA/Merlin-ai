@@ -1,5 +1,5 @@
 import { createBrowserRouter, redirect } from "react-router";
-import { Layout, AskAiRoute, SplitLayout } from "./components/layout";
+import { Layout, AskAiRoute, SplitLayout, NotFoundRedirect } from "./components/layout";
 import { LandingPage } from "./components/landing-page";
 import { LoginPage } from "./components/login-page";
 import { DashboardPage } from "./components/dashboard-page";
@@ -49,4 +49,9 @@ export const router = createBrowserRouter([
     children: [{ index: true, Component: SettingsPage }],
   },
   { path: "/calls", loader: () => redirect("/library") },
+
+  // ── Catch-all: unknown paths (e.g. a direct/typed navigation to a
+  // backend-only path like /data) redirect by auth state instead of
+  // react-router's default "no routes matched" page ───────────────────────
+  { path: "*", Component: NotFoundRedirect },
 ]);

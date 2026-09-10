@@ -107,6 +107,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             username          TEXT NOT NULL,
             securityquestion  TEXT NOT NULL,
             answer            TEXT NOT NULL,
+            title             TEXT NOT NULL DEFAULT '',
+            role              TEXT NOT NULL DEFAULT 'member',
             lastloggedin      INTEGER
         );
 
@@ -124,6 +126,13 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     for col, typedef in [("transcript", "TEXT"), ("video_url", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE meetings ADD COLUMN {col} {typedef}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+    for col, typedef in [("role", "TEXT NOT NULL DEFAULT 'member'"), ("title", "TEXT NOT NULL DEFAULT ''")]:
+        try:
+            conn.execute(f"ALTER TABLE auth ADD COLUMN {col} {typedef}")
             conn.commit()
         except Exception:
             pass  # column already exists
@@ -612,13 +621,13 @@ def delete_product_insights(ids: list[str] | None = None) -> None:
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
-def create_auth_user(emailid: str, username: str, password_hash: str, securityquestion: str, answer_hash: str) -> dict:
+def create_auth_user(emailid: str, username: str, password_hash: str, securityquestion: str, answer_hash: str, title: str = "", role: str = "member") -> dict:
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT INTO auth (emailid, password, username, securityquestion, answer, lastloggedin)"
-            " VALUES (?, ?, ?, ?, ?, NULL)",
-            (emailid, password_hash, username, securityquestion, answer_hash),
+            "INSERT INTO auth (emailid, password, username, securityquestion, answer, title, role, lastloggedin)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            (emailid, password_hash, username, securityquestion, answer_hash, title, role),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM auth WHERE emailid = ?", (emailid,)).fetchone()

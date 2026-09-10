@@ -285,3 +285,12 @@ export function AskAiRoute() {
     </DataProvider>
   );
 }
+
+// ─── Catch-all (unknown paths, e.g. a direct/typed navigation to a backend-only
+// path like /data) — send authenticated users to the dashboard and everyone
+// else to login, instead of react-router's default "no routes matched" page. ──
+
+export function NotFoundRedirect() {
+  const { email } = useAuth();
+  return <Navigate to={email ? "/dashboard" : "/login"} replace />;
+}

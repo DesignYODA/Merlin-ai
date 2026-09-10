@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate, Navigate } from "react-router";
-import { ArrowLeft, ArrowRight, Mail, Lock, User, HelpCircle, ShieldX, CheckCircle2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Mail, Lock, User, HelpCircle, ShieldX, CheckCircle2, Eye, EyeOff, Briefcase } from "lucide-react";
 import { useAuth } from "../auth";
 import { authSignup, authGetSecurityQuestion, authResetPassword } from "../api";
 import { GlisseoBase, GlisseoLogo } from "./glisseo-mark";
@@ -18,8 +18,22 @@ type Mode = "login" | "signup" | "forgot-request" | "forgot-reset";
 
 const inputClass =
   "w-full bg-app-elevated border border-[#2a2a3e] rounded-lg pl-9 pr-4 py-2.5 text-white placeholder-[#3a3a50] outline-none focus:border-[#ec5d25]/60 focus:ring-1 focus:ring-[#ec5d25]/30 transition-all";
+const passwordInputClass = inputClass.replace("pr-4", "pr-9");
 const iconClass = "absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#555568] pointer-events-none";
 const labelClass = "block text-[#8888a0] mb-1.5" as const;
+
+function PasswordVisibilityToggle({ show, onToggle }: { show: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="absolute right-3 top-1/2 -translate-y-1/2 text-[#555568] hover:text-white transition-colors"
+      aria-label={show ? "Hide password" : "Show password"}
+    >
+      {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+    </button>
+  );
+}
 
 export function LoginPage() {
   const { email: authedEmail, login } = useAuth();
@@ -33,14 +47,18 @@ export function LoginPage() {
   // Shared / login fields
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
   // Signup fields
   const [signupUsername, setSignupUsername] = useState("");
   const [signupEmail, setSignupEmail] = useState("");
   const [signupPassword, setSignupPassword] = useState("");
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
+  const [showSignupPassword, setShowSignupPassword] = useState(false);
+  const [showSignupConfirmPassword, setShowSignupConfirmPassword] = useState(false);
   const [signupQuestion, setSignupQuestion] = useState(SECURITY_QUESTIONS[0]);
   const [signupAnswer, setSignupAnswer] = useState("");
+  const [signupTitle, setSignupTitle] = useState("");
 
   // Forgot-password fields
   const [forgotEmail, setForgotEmail] = useState("");
@@ -48,6 +66,8 @@ export function LoginPage() {
   const [forgotAnswer, setForgotAnswer] = useState("");
   const [forgotNewPassword, setForgotNewPassword] = useState("");
   const [forgotConfirmPassword, setForgotConfirmPassword] = useState("");
+  const [showForgotNewPassword, setShowForgotNewPassword] = useState(false);
+  const [showForgotConfirmPassword, setShowForgotConfirmPassword] = useState(false);
 
   if (authedEmail) return <Navigate to="/dashboard" replace />;
 
@@ -89,6 +109,8 @@ export function LoginPage() {
         password: signupPassword,
         securityquestion: signupQuestion,
         answer: signupAnswer,
+        title: signupTitle,
+        role: "member",
       });
       setEmail(signupEmail);
       goTo("login");
@@ -190,7 +212,7 @@ export function LoginPage() {
                 }}
               />
               <div style={{ filter: "drop-shadow(0 30px 50px rgba(0,0,0,0.55))" }}>
-                <GlisseoGlobe size={380} />
+                <GlisseoGlobe size={400} />
               </div>
             </div>
             <div style={{ marginTop: -50 }}>
@@ -247,14 +269,15 @@ export function LoginPage() {
                     <div className="relative">
                       <Lock className={iconClass} />
                       <input
-                        type="password"
+                        type={showPassword ? "text" : "password"}
                         placeholder="Password"
                         value={password}
                         onChange={(e) => { setPassword(e.target.value); setError(""); }}
                         required
-                        className={inputClass}
+                        className={passwordInputClass}
                         style={{ fontSize: "0.85rem" }}
                       />
+                      <PasswordVisibilityToggle show={showPassword} onToggle={() => setShowPassword((v) => !v)} />
                     </div>
 
                     {error && (
@@ -291,7 +314,7 @@ export function LoginPage() {
                     <button
                       type="button"
                       onClick={() => goTo("signup")}
-                      className="text-[#ec5d25] hover:text-[#f06830] font-medium transition-colors"
+                      className="text-[#ec5d25] hover:text-[#f06830] font-medium transition-colors cursor-pointer"
                     >
                       Sign up
                     </button>
@@ -305,7 +328,7 @@ export function LoginPage() {
                     Create account
                   </h2>
                   <p className="text-[#555568] mb-5 text-center" style={{ fontSize: "0.8rem" }}>
-                    Sign up to get started with Glisseo AI.
+                    Sign up to get started with Glisseo.
                   </p>
 
                   <form onSubmit={handleSignup} className="space-y-3">
@@ -335,14 +358,12 @@ export function LoginPage() {
                       />
                     </div>
                     <div className="relative">
-                      <Lock className={iconClass} />
+                      <Briefcase className={iconClass} />
                       <input
-                        type="password"
-                        placeholder="Password (min. 6 characters)"
-                        value={signupPassword}
-                        onChange={(e) => { setSignupPassword(e.target.value); setError(""); }}
-                        required
-                        minLength={6}
+                        type="text"
+                        placeholder="Title/Role"
+                        value={signupTitle}
+                        onChange={(e) => { setSignupTitle(e.target.value); setError(""); }}
                         className={inputClass}
                         style={{ fontSize: "0.85rem" }}
                       />
@@ -350,15 +371,30 @@ export function LoginPage() {
                     <div className="relative">
                       <Lock className={iconClass} />
                       <input
-                        type="password"
+                        type={showSignupPassword ? "text" : "password"}
+                        placeholder="Password (min. 6 characters)"
+                        value={signupPassword}
+                        onChange={(e) => { setSignupPassword(e.target.value); setError(""); }}
+                        required
+                        minLength={6}
+                        className={passwordInputClass}
+                        style={{ fontSize: "0.85rem" }}
+                      />
+                      <PasswordVisibilityToggle show={showSignupPassword} onToggle={() => setShowSignupPassword((v) => !v)} />
+                    </div>
+                    <div className="relative">
+                      <Lock className={iconClass} />
+                      <input
+                        type={showSignupConfirmPassword ? "text" : "password"}
                         placeholder="Confirm password"
                         value={signupConfirmPassword}
                         onChange={(e) => { setSignupConfirmPassword(e.target.value); setError(""); }}
                         required
                         minLength={6}
-                        className={inputClass}
+                        className={passwordInputClass}
                         style={{ fontSize: "0.85rem" }}
                       />
+                      <PasswordVisibilityToggle show={showSignupConfirmPassword} onToggle={() => setShowSignupConfirmPassword((v) => !v)} />
                     </div>
                     <div>
                       <label className={labelClass} style={{ fontSize: "0.72rem" }}>Security question</label>
@@ -480,28 +516,30 @@ export function LoginPage() {
                     <div className="relative">
                       <Lock className={iconClass} />
                       <input
-                        type="password"
+                        type={showForgotNewPassword ? "text" : "password"}
                         placeholder="New password (min. 6 characters)"
                         value={forgotNewPassword}
                         onChange={(e) => { setForgotNewPassword(e.target.value); setError(""); }}
                         required
                         minLength={6}
-                        className={inputClass}
+                        className={passwordInputClass}
                         style={{ fontSize: "0.85rem" }}
                       />
+                      <PasswordVisibilityToggle show={showForgotNewPassword} onToggle={() => setShowForgotNewPassword((v) => !v)} />
                     </div>
                     <div className="relative">
                       <Lock className={iconClass} />
                       <input
-                        type="password"
+                        type={showForgotConfirmPassword ? "text" : "password"}
                         placeholder="Confirm new password"
                         value={forgotConfirmPassword}
                         onChange={(e) => { setForgotConfirmPassword(e.target.value); setError(""); }}
                         required
                         minLength={6}
-                        className={inputClass}
+                        className={passwordInputClass}
                         style={{ fontSize: "0.85rem" }}
                       />
+                      <PasswordVisibilityToggle show={showForgotConfirmPassword} onToggle={() => setShowForgotConfirmPassword((v) => !v)} />
                     </div>
 
                     {error && (
@@ -525,7 +563,7 @@ export function LoginPage() {
             </div>
 
             <p className="text-center text-[#333348] mt-6" style={{ fontSize: "0.7rem" }}>
-              Glisseo AI · Sales intelligence, automated.
+              Glisseo AI · Sales intelligence automated.
             </p>
           </div>
         </div>

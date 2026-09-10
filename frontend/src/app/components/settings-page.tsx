@@ -3,9 +3,10 @@ import { useNavigate } from "react-router";
 import {
   Key, RefreshCw, Bell, Shield, Database,
   CheckCircle, XCircle, Loader2, CloudDownload, HardDrive, X,
-  Play, Handshake,
+  Play, Handshake, LogOut,
 } from "lucide-react";
 import { useData } from "./data-context";
+import { useAuth } from "../auth";
 import {
   setFirefliesApiKey as apiSetFirefliesKey,
   setGroqApiKey as apiSetGroqKey,
@@ -13,24 +14,32 @@ import {
   resetHubspot,
 } from "../api";
 
-type Tab = "keys" | "sync" | "account" | "notifications";
+type Tab = "sync" | "account" | "notifications";
 
-const TABS: { id: Tab; label: string; icon: ReactNode }[] = [
-  { id: "keys",          label: "API Keys",      icon: <Key className="w-4 h-4" /> },
-  { id: "sync",          label: "Sync & Data",   icon: <HardDrive className="w-4 h-4" /> },
+const ALL_TABS: { id: Tab; label: string; icon: ReactNode; adminOnly?: boolean }[] = [
+  { id: "sync",          label: "Sync & Data",   icon: <HardDrive className="w-4 h-4" />, adminOnly: true },
   { id: "account",       label: "Account",       icon: <Shield className="w-4 h-4" /> },
   { id: "notifications", label: "Notifications", icon: <Bell className="w-4 h-4" /> },
 ];
 
+function formatUTC(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+}
+
 export function SettingsPage() {
   const navigate = useNavigate();
   const {
-    calls, user, isLive, isLoading, error, refresh, fullSync,
+    calls, isLive, isLoading, error, refresh, fullSync,
     lastSynced, totalCallsFetched, fetchProgress, syncStatus, isSyncing, dbCallCount,
     runHubspotSync, runHubspotIncrementalSync, isHubspotSyncing, hubspotSyncStatus,
   } = useData();
+  const { username, role, lastLoggedIn, logout } = useAuth();
+  const isAdmin = role === "admin";
+  const TABS = ALL_TABS.filter((t) => !t.adminOnly || isAdmin);
 
-  const [tab, setTab] = useState<Tab>("keys");
+  const [tab, setTab] = useState<Tab>("account");
 
   // Key inputs
   const [firefliesKey, setFirefliesKey] = useState("");
@@ -147,45 +156,7 @@ export function SettingsPage() {
         {/* ── Right content ── */}
         <div className="flex-1 overflow-y-auto">
 
-          {/* ── API Keys ── */}
-          {tab === "keys" && (
-            <div className="p-7 space-y-6">
-              <SectionHeader icon={<Key className="w-4 h-4 text-[#ec5d25]" />} title="API Keys" />
-
-              {saveStatus && (
-                <div className={`text-xs px-3 py-2 rounded-lg ${saveStatus.startsWith("✓") ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"}`}>
-                  {saveStatus}
-                </div>
-              )}
-
-              <KeyField
-                label="Fireflies API Key"
-                placeholder="ff_…"
-                value={firefliesKey}
-                onChange={setFirefliesKey}
-                onSave={() => saveKey("Fireflies key", firefliesKey, apiSetFirefliesKey, () => setFirefliesKey(""))}
-                saving={isSavingKeys}
-              />
-              <KeyField
-                label="Groq API Key"
-                placeholder="gsk_…"
-                value={groqKey}
-                onChange={setGroqKey}
-                onSave={() => saveKey("Groq key", groqKey, apiSetGroqKey, () => setGroqKey(""))}
-                saving={isSavingKeys}
-              />
-              <KeyField
-                label="HubSpot API Key"
-                placeholder="pat-…"
-                value={hubspotKey}
-                onChange={setHubspotKey}
-                onSave={() => saveKey("HubSpot key", hubspotKey, apiSetHubSpotKey, () => setHubspotKey(""))}
-                saving={isSavingKeys}
-              />
-            </div>
-          )}
-
-          {/* ── Sync & Data ── */}
+          {/* ── Sync & Data (Admin only) ── */}
           {tab === "sync" && (
             <div className="p-7 space-y-5">
               <SectionHeader icon={<HardDrive className="w-4 h-4 text-cyan-400" />} title="Sync & Data" />
@@ -264,15 +235,6 @@ export function SettingsPage() {
                 >
                   {isSyncing && <Loader2 className="w-3 h-3 animate-spin" />}
                   <span>{fetchProgress}</span>
-                  {(fetchProgress.includes("failed") || fetchProgress.includes("Failed")) && (
-                    <button
-                      onClick={() => setTab("keys")}
-                      className="underline underline-offset-2 hover:opacity-70 transition-opacity"
-                      style={{ color: "#60a5fa", background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: "inherit" }}
-                    >
-                      Check API Keys
-                    </button>
-                  )}
                 </div>
               )}
 
@@ -334,6 +296,42 @@ export function SettingsPage() {
                   <span>{calls.reduce((s, c) => s + c.actionItems.length, 0)} action items</span>
                 </div>
               </div>
+
+              {/* ── API Keys ── */}
+              <div className="border-t border-[#1e1e28] pt-5 space-y-4">
+                <SectionHeader icon={<Key className="w-4 h-4 text-[#ec5d25]" />} title="API Keys" />
+
+                {saveStatus && (
+                  <div className={`text-xs px-3 py-2 rounded-lg ${saveStatus.startsWith("✓") ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"}`}>
+                    {saveStatus}
+                  </div>
+                )}
+
+                <KeyField
+                  label="Fireflies API Key"
+                  placeholder="ff_…"
+                  value={firefliesKey}
+                  onChange={setFirefliesKey}
+                  onSave={() => saveKey("Fireflies key", firefliesKey, apiSetFirefliesKey, () => setFirefliesKey(""))}
+                  saving={isSavingKeys}
+                />
+                <KeyField
+                  label="Groq API Key"
+                  placeholder="gsk_…"
+                  value={groqKey}
+                  onChange={setGroqKey}
+                  onSave={() => saveKey("Groq key", groqKey, apiSetGroqKey, () => setGroqKey(""))}
+                  saving={isSavingKeys}
+                />
+                <KeyField
+                  label="HubSpot API Key"
+                  placeholder="pat-…"
+                  value={hubspotKey}
+                  onChange={setHubspotKey}
+                  onSave={() => saveKey("HubSpot key", hubspotKey, apiSetHubSpotKey, () => setHubspotKey(""))}
+                  saving={isSavingKeys}
+                />
+              </div>
             </div>
           )}
 
@@ -341,16 +339,19 @@ export function SettingsPage() {
           {tab === "account" && (
             <div className="p-7 space-y-6">
               <SectionHeader icon={<Shield className="w-4 h-4 text-emerald-400" />} title="Account" />
-              {user ? (
-                <div className="grid grid-cols-2 gap-3">
-                  <StatTile label="Name" value={user.name} />
-                  <StatTile label="Email" value={user.email} />
-                  <StatTile label="Minutes Consumed" value={user.minutes_consumed?.toLocaleString() ?? "N/A"} />
-                  <StatTile label="Role" value={user.is_admin ? "Admin" : "Member"} />
-                </div>
-              ) : (
-                <p className="text-[#555]" style={{ fontSize: "0.82rem" }}>No account info available.</p>
-              )}
+              <div className="grid grid-cols-2 gap-3">
+                <StatTile label="Name" value={username ?? "—"} />
+                <StatTile label="Role" value={isAdmin ? "Admin" : "Member"} />
+                <StatTile label="Last Logged In" value={lastLoggedIn ? formatUTC(lastLoggedIn) : "—"} />
+              </div>
+              <button
+                onClick={logout}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg border border-[#2a2a34] text-[#888] hover:text-rose-400 hover:border-rose-500/40 transition-colors"
+                style={{ fontSize: "0.82rem" }}
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Log out
+              </button>
             </div>
           )}
 
