@@ -1,395 +1,134 @@
 """
-hubspot.py — SQLite access layer for hubspot_data.sqlite
+hubspot.py — MySQL access layer for the HubSpot side of glessio_master.
 
 Normalized tables:
-  companies — one row per HubSpot company
-  deals     — one row per deal (company_id FK)
-  notes     — one row per note (company_id FK)
-  emails    — one row per email engagement (company_id FK)
-  contacts  — one row per contact (company_id FK)
+  hs_companies — one row per HubSpot company
+  hs_deals     — one row per deal (company_id FK)
+  hs_notes     — one row per note (company_id FK)
+  hs_emails    — one row per email engagement (company_id FK)
+  hs_contacts  — one row per contact (company_id FK)
+  hs_kv        — small key/value store (sync status, cached pipeline labels)
 
-On first open, migrates any existing legacy flat hubspot_data table automatically.
+Was SQLite (hubspot_data.sqlite: companies, deals, notes, emails, contacts, hs_kv) —
+migrated to MySQL. Every public function keeps its original name/signature/return
+shape so interface.py/handler.py need no changes. See backend/db/mysql_pool.py for
+the shared connection pool and full schema DDL.
 """
 
 import json
-import os
-import sqlite3
-import threading
 import time
 
-from config.config import IS_LAMBDA, HUBSPOT_REPLICA_PATH
+from db.mysql_pool import get_connection
 from config.logging_config import get_logger
 
 logger = get_logger("merlin.db.hubspot")
 
-_DATA_DIR = "/tmp/data" if IS_LAMBDA else os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-HUBSPOT_DB_PATH = os.environ.get("HUBSPOT_PATH", os.path.join(_DATA_DIR, "hubspot_data.sqlite"))
-
-os.makedirs(os.path.dirname(os.path.abspath(HUBSPOT_DB_PATH)), exist_ok=True)
-
-# Two separate locks, one per connection object/file. _conn (primary,
-# hubspot_data.sqlite) and _replica_conn (replica, hubspot_data_replica.sqlite)
-# are different connections to different files with no shared state — sharing
-# one lock between them meant every replica read (every /hubspot/* GET) waited
-# on primary writes and vice versa, for no reason. RLock (not Lock) on the
-# replica side specifically: a replica reader can self-heal a missing replica
-# file by calling replicate_to_read_replica(), which itself re-acquires
-# _replica_lock for its final swap step — a plain Lock would deadlock the
-# calling thread.
-_lock = threading.RLock()          # guards _conn (primary)
-_replica_lock = threading.RLock()  # guards _replica_conn (replica)
-_conn: sqlite3.Connection | None = None
-
-
-def _get_conn() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(HUBSPOT_DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.executescript("""
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA cache_size = -8000;
-            PRAGMA temp_store = MEMORY;
-        """)
-        _init_schema(_conn)
-    return _conn
-
-
-def _init_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS hs_kv (
-            key   TEXT NOT NULL PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS companies (
-            company_id          TEXT NOT NULL PRIMARY KEY,
-            name                TEXT NOT NULL DEFAULT '',
-            domain              TEXT NOT NULL DEFAULT '',
-            phone               TEXT NOT NULL DEFAULT '',
-            city                TEXT NOT NULL DEFAULT '',
-            state               TEXT NOT NULL DEFAULT '',
-            country             TEXT NOT NULL DEFAULT '',
-            industry            TEXT NOT NULL DEFAULT '',
-            createdate          TEXT NOT NULL DEFAULT '',
-            lifecyclestage      TEXT NOT NULL DEFAULT '',
-            hubspot_owner_id    TEXT NOT NULL DEFAULT '',
-            hs_lastmodifieddate TEXT NOT NULL DEFAULT '',
-            synced_at           INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS deals (
-            deal_id             TEXT NOT NULL PRIMARY KEY,
-            company_id          TEXT NOT NULL DEFAULT '',
-            dealname            TEXT NOT NULL DEFAULT '',
-            amount              TEXT NOT NULL DEFAULT '',
-            dealstage           TEXT NOT NULL DEFAULT '',
-            dealstage_label     TEXT NOT NULL DEFAULT '',
-            closedate           TEXT NOT NULL DEFAULT '',
-            pipeline            TEXT NOT NULL DEFAULT '',
-            pipeline_label      TEXT NOT NULL DEFAULT '',
-            hubspot_owner_id    TEXT NOT NULL DEFAULT '',
-            createdate          TEXT NOT NULL DEFAULT '',
-            hs_lastmodifieddate TEXT NOT NULL DEFAULT '',
-            synced_at           INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS notes (
-            note_id             TEXT NOT NULL PRIMARY KEY,
-            company_id          TEXT NOT NULL DEFAULT '',
-            hs_note_body        TEXT NOT NULL DEFAULT '',
-            hs_createdate       TEXT NOT NULL DEFAULT '',
-            hs_lastmodifieddate TEXT NOT NULL DEFAULT '',
-            hubspot_owner_id    TEXT NOT NULL DEFAULT '',
-            hs_timestamp        TEXT NOT NULL DEFAULT '',
-            url                 TEXT NOT NULL DEFAULT '',
-            synced_at           INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS emails (
-            email_id            TEXT NOT NULL PRIMARY KEY,
-            company_id          TEXT NOT NULL DEFAULT '',
-            hs_email_subject    TEXT NOT NULL DEFAULT '',
-            hs_email_text       TEXT NOT NULL DEFAULT '',
-            hs_createdate       TEXT NOT NULL DEFAULT '',
-            hs_lastmodifieddate TEXT NOT NULL DEFAULT '',
-            hubspot_owner_id    TEXT NOT NULL DEFAULT '',
-            hs_timestamp        TEXT NOT NULL DEFAULT '',
-            url                 TEXT NOT NULL DEFAULT '',
-            synced_at           INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS contacts (
-            contact_id          TEXT NOT NULL PRIMARY KEY,
-            company_id          TEXT NOT NULL DEFAULT '',
-            firstname           TEXT NOT NULL DEFAULT '',
-            lastname            TEXT NOT NULL DEFAULT '',
-            email               TEXT NOT NULL DEFAULT '',
-            createdate          TEXT NOT NULL DEFAULT '',
-            lastmodifieddate    TEXT NOT NULL DEFAULT '',
-            url                 TEXT NOT NULL DEFAULT '',
-            synced_at           INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_deals_company ON deals(company_id);
-        CREATE INDEX IF NOT EXISTS idx_notes_company ON notes(company_id);
-        CREATE INDEX IF NOT EXISTS idx_emails_company ON emails(company_id);
-        CREATE INDEX IF NOT EXISTS idx_contacts_company ON contacts(company_id);
-
-        -- Covers get_hubspot_flat_data()'s global ORDER BY (avoids a temp b-tree
-        -- sort over the full table) and get_hubspot_company_details()'s
-        -- per-company lookup (company_id, date) in a single index scan.
-        CREATE INDEX IF NOT EXISTS idx_deals_closedate ON deals(closedate DESC, createdate DESC);
-        CREATE INDEX IF NOT EXISTS idx_notes_company_date ON notes(company_id, hs_createdate DESC);
-        CREATE INDEX IF NOT EXISTS idx_emails_company_date ON emails(company_id, hs_createdate DESC);
-    """)
-    conn.commit()
-    _migrate_add_deal_labels(conn)
-    _migrate_add_url_columns(conn)
-    _migrate_old_flat_table(conn)
-
-
-def _migrate_add_deal_labels(conn: sqlite3.Connection) -> None:
-    """Add label columns to existing deals tables that predate them."""
-    for col in ("dealstage_label", "pipeline_label"):
-        try:
-            conn.execute(f"ALTER TABLE deals ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-
-def _migrate_add_url_columns(conn: sqlite3.Connection) -> None:
-    """Add the `url` column (HubSpot's own deep link) to notes/emails tables that predate it."""
-    for table in ("notes", "emails"):
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN url TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-
-def _migrate_old_flat_table(conn: sqlite3.Connection) -> None:
-    """One-time migration: copy rows from legacy flat hubspot_data into normalized tables."""
-    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "hubspot_data" not in tables:
-        return
-    old_cols = {r[1] for r in conn.execute("PRAGMA table_info(hubspot_data)").fetchall()}
-    if "company_name" not in old_cols:
-        return
-
-    logger.info("[hubspot db] Migrating flat hubspot_data -> normalized tables...")
-    conn.execute("""
-        INSERT OR IGNORE INTO companies
-            (company_id, name, domain, phone, city, state, country,
-             industry, createdate, lifecyclestage, hubspot_owner_id,
-             hs_lastmodifieddate, synced_at)
-        SELECT DISTINCT
-            company_id, company_name, company_domain, company_phone,
-            company_city, company_state, company_country, company_industry,
-            company_createdate, company_lifecyclestage, company_hubspot_owner_id,
-            company_hs_lastmodifieddate, synced_at
-        FROM hubspot_data WHERE company_id != ''
-    """)
-    conn.execute("""
-        INSERT OR IGNORE INTO deals
-            (deal_id, company_id, dealname, amount, dealstage, closedate,
-             pipeline, hubspot_owner_id, createdate, hs_lastmodifieddate, synced_at)
-        SELECT DISTINCT
-            deal_id, company_id, deal_name, deal_amount, deal_dealstage,
-            deal_closedate, deal_pipeline, deal_hubspot_owner_id,
-            deal_createdate, deal_hs_lastmodifieddate, synced_at
-        FROM hubspot_data WHERE deal_id != ''
-    """)
-    conn.execute("""
-        INSERT OR IGNORE INTO notes
-            (note_id, company_id, hs_note_body, hs_createdate, hs_lastmodifieddate,
-             hubspot_owner_id, hs_timestamp, synced_at)
-        SELECT
-            note_id, company_id, note_hs_note_body, note_hs_createdate,
-            note_hs_lastmodifieddate, note_hubspot_owner_id, note_hs_timestamp, synced_at
-        FROM hubspot_data WHERE note_id NOT LIKE '_co_%'
-    """)
-    conn.commit()
-    logger.info("[hubspot db] Migration complete")
-
 
 def close_hubspot_db() -> None:
-    global _conn
-    with _lock:
-        if _conn:
-            _conn.close()
-            _conn = None
-    close_hubspot_replica()
-
-
-# ─── Read replica ─────────────────────────────────────────────────────────────
-# A separate file, read-only, that frontend-facing GET endpoints query instead
-# of the primary. Refreshed via SQLite's online backup API (safe to run while
-# the primary is mid-write) right after each sync writes to the primary —
-# see replicate_to_read_replica() callers in interface/handler.py.
-
-_replica_conn: sqlite3.Connection | None = None
+    """No per-module connection to close anymore — the shared pool (owned by
+    mysql_pool.py) is closed once from main.py's lifespan. Kept as a no-op so
+    any existing import of close_hubspot_db doesn't break."""
+    pass
 
 
 def replicate_to_read_replica() -> None:
-    """Snapshot the primary DB into the read replica file.
-
-    The actual page-by-page copy (multi-second for a 250MB+ DB) runs with NO
-    lock held: it uses its own read-only connection to the primary file (WAL
-    mode gives it a consistent snapshot without blocking/being blocked by
-    concurrent writers) and writes into a fresh temp file nobody else has
-    open. _lock is only taken twice, briefly: once to make sure the primary
-    is initialized, and once at the end to close the old replica handle and
-    atomically swap the temp file into place. Previously the whole backup()
-    call ran under _lock, so every /hubspot/* GET request (which also takes
-    _lock to read the replica) queued up behind it for the full copy duration
-    every ~30 min cron cycle — this is what caused /hubspot/flat-data to time
-    out.
-    """
-    global _replica_conn
-    with _lock:
-        _get_conn()  # ensure primary connection/schema exists
-
-    tmp_path = HUBSPOT_REPLICA_PATH + ".tmp"
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        try:
-            os.remove(tmp_path + suffix)
-        except FileNotFoundError:
-            pass
-
-    src = sqlite3.connect(f"file:{HUBSPOT_DB_PATH}?mode=ro", uri=True)
-    dest = sqlite3.connect(tmp_path)
-    try:
-        src.backup(dest)
-    finally:
-        src.close()
-        dest.close()
-
-    with _replica_lock:
-        if _replica_conn is not None:
-            _replica_conn.close()
-            _replica_conn = None
-        # Windows can hold an mmap'd SQLite file's handle open briefly after
-        # .close() returns (the OS unmaps it asynchronously), so an
-        # os.replace() right after can transiently raise PermissionError even
-        # though nothing else in this process still has it open. Retry a few
-        # times with a short backoff rather than letting one bad-timing
-        # replicate() call fail the whole sync.
-        for attempt in range(5):
-            try:
-                os.replace(tmp_path, HUBSPOT_REPLICA_PATH)
-                break
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.1 * (attempt + 1))
+    """No-op — MySQL's InnoDB engine handles concurrent reads-during-writes
+    natively via MVCC, so the SQLite-only "copy to a second file so reads
+    don't block on writes" trick this used to do is unnecessary. Kept as a
+    no-op so handler.py's existing `await asyncio.to_thread(_replicate_hubspot)`
+    call sites need no changes."""
+    pass
 
 
-def _get_replica_conn() -> sqlite3.Connection:
-    global _replica_conn
-    if _replica_conn is None:
-        if not os.path.exists(HUBSPOT_REPLICA_PATH):
-            replicate_to_read_replica()
-        _replica_conn = sqlite3.connect(f"file:{HUBSPOT_REPLICA_PATH}?mode=ro", uri=True, check_same_thread=False)
-        _replica_conn.row_factory = sqlite3.Row
-        _replica_conn.executescript("""
-            PRAGMA cache_size = -65536;
-            PRAGMA mmap_size = 268435456;
-            PRAGMA temp_store = MEMORY;
-        """)
-    return _replica_conn
-
-
-def close_hubspot_replica() -> None:
-    global _replica_conn
-    with _replica_lock:
-        if _replica_conn:
-            _replica_conn.close()
-            _replica_conn = None
-
-
-# ─── KV helpers ───────────────────────────────────────────────────────────────
+# ─── KV helpers (hs_kv) ─────────────────────────────────────────────────────
 
 def hs_kv_get(key: str):
-    with _lock:
-        row = _get_conn().execute("SELECT value FROM hs_kv WHERE key = ?", (key,)).fetchone()
-        return json.loads(row["value"]) if row else None
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT `value` FROM hs_kv WHERE `key` = %s", (key,))
+        row = cur.fetchone()
+        cur.close()
+        return json.loads(row[0]) if row else None
 
 
 def hs_kv_set(key: str, value) -> None:
-    with _lock:
-        conn = _get_conn()
-        conn.execute(
-            "INSERT INTO hs_kv (key, value) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, json.dumps(value)),
-        )
-        conn.commit()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO hs_kv (`key`, `value`) VALUES (%s, %s)"
+                " ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+                (key, json.dumps(value)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
 # ─── Upsert SQL ───────────────────────────────────────────────────────────────
 
 _COMPANY_UPSERT = """
-    INSERT INTO companies (company_id, name, domain, phone, city, state, country,
+    INSERT INTO hs_companies (company_id, name, domain, phone, city, state, country,
         industry, createdate, lifecyclestage, hubspot_owner_id, hs_lastmodifieddate, synced_at)
-    VALUES (:company_id, :name, :domain, :phone, :city, :state, :country,
-        :industry, :createdate, :lifecyclestage, :hubspot_owner_id, :hs_lastmodifieddate, :synced_at)
-    ON CONFLICT(company_id) DO UPDATE SET
-        name=excluded.name, domain=excluded.domain, phone=excluded.phone,
-        city=excluded.city, state=excluded.state, country=excluded.country,
-        industry=excluded.industry, createdate=excluded.createdate,
-        lifecyclestage=excluded.lifecyclestage, hubspot_owner_id=excluded.hubspot_owner_id,
-        hs_lastmodifieddate=excluded.hs_lastmodifieddate, synced_at=excluded.synced_at
+    VALUES (%(company_id)s, %(name)s, %(domain)s, %(phone)s, %(city)s, %(state)s, %(country)s,
+        %(industry)s, %(createdate)s, %(lifecyclestage)s, %(hubspot_owner_id)s, %(hs_lastmodifieddate)s, %(synced_at)s)
+    ON DUPLICATE KEY UPDATE
+        name=VALUES(name), domain=VALUES(domain), phone=VALUES(phone),
+        city=VALUES(city), state=VALUES(state), country=VALUES(country),
+        industry=VALUES(industry), createdate=VALUES(createdate),
+        lifecyclestage=VALUES(lifecyclestage), hubspot_owner_id=VALUES(hubspot_owner_id),
+        hs_lastmodifieddate=VALUES(hs_lastmodifieddate), synced_at=VALUES(synced_at)
 """
 
 _DEAL_UPSERT = """
-    INSERT INTO deals (deal_id, company_id, dealname, amount, dealstage, dealstage_label,
+    INSERT INTO hs_deals (deal_id, company_id, dealname, amount, dealstage, dealstage_label,
         closedate, pipeline, pipeline_label, hubspot_owner_id, createdate, hs_lastmodifieddate, synced_at)
-    VALUES (:deal_id, :company_id, :dealname, :amount, :dealstage, :dealstage_label,
-        :closedate, :pipeline, :pipeline_label, :hubspot_owner_id, :createdate, :hs_lastmodifieddate, :synced_at)
-    ON CONFLICT(deal_id) DO UPDATE SET
-        company_id=excluded.company_id, dealname=excluded.dealname, amount=excluded.amount,
-        dealstage=excluded.dealstage, dealstage_label=excluded.dealstage_label,
-        closedate=excluded.closedate, pipeline=excluded.pipeline, pipeline_label=excluded.pipeline_label,
-        hubspot_owner_id=excluded.hubspot_owner_id, createdate=excluded.createdate,
-        hs_lastmodifieddate=excluded.hs_lastmodifieddate, synced_at=excluded.synced_at
+    VALUES (%(deal_id)s, %(company_id)s, %(dealname)s, %(amount)s, %(dealstage)s, %(dealstage_label)s,
+        %(closedate)s, %(pipeline)s, %(pipeline_label)s, %(hubspot_owner_id)s, %(createdate)s, %(hs_lastmodifieddate)s, %(synced_at)s)
+    ON DUPLICATE KEY UPDATE
+        company_id=VALUES(company_id), dealname=VALUES(dealname), amount=VALUES(amount),
+        dealstage=VALUES(dealstage), dealstage_label=VALUES(dealstage_label),
+        closedate=VALUES(closedate), pipeline=VALUES(pipeline), pipeline_label=VALUES(pipeline_label),
+        hubspot_owner_id=VALUES(hubspot_owner_id), createdate=VALUES(createdate),
+        hs_lastmodifieddate=VALUES(hs_lastmodifieddate), synced_at=VALUES(synced_at)
 """
 
 _NOTE_UPSERT = """
-    INSERT INTO notes (note_id, company_id, hs_note_body, hs_createdate, hs_lastmodifieddate,
+    INSERT INTO hs_notes (note_id, company_id, hs_note_body, hs_createdate, hs_lastmodifieddate,
         hubspot_owner_id, hs_timestamp, url, synced_at)
-    VALUES (:note_id, :company_id, :hs_note_body, :hs_createdate, :hs_lastmodifieddate,
-        :hubspot_owner_id, :hs_timestamp, :url, :synced_at)
-    ON CONFLICT(note_id) DO UPDATE SET
-        company_id=excluded.company_id, hs_note_body=excluded.hs_note_body,
-        hs_createdate=excluded.hs_createdate, hs_lastmodifieddate=excluded.hs_lastmodifieddate,
-        hubspot_owner_id=excluded.hubspot_owner_id, hs_timestamp=excluded.hs_timestamp,
-        url=excluded.url, synced_at=excluded.synced_at
+    VALUES (%(note_id)s, %(company_id)s, %(hs_note_body)s, %(hs_createdate)s, %(hs_lastmodifieddate)s,
+        %(hubspot_owner_id)s, %(hs_timestamp)s, %(url)s, %(synced_at)s)
+    ON DUPLICATE KEY UPDATE
+        company_id=VALUES(company_id), hs_note_body=VALUES(hs_note_body),
+        hs_createdate=VALUES(hs_createdate), hs_lastmodifieddate=VALUES(hs_lastmodifieddate),
+        hubspot_owner_id=VALUES(hubspot_owner_id), hs_timestamp=VALUES(hs_timestamp),
+        url=VALUES(url), synced_at=VALUES(synced_at)
 """
 
 _EMAIL_UPSERT = """
-    INSERT INTO emails (email_id, company_id, hs_email_subject, hs_email_text, hs_createdate,
+    INSERT INTO hs_emails (email_id, company_id, hs_email_subject, hs_email_text, hs_createdate,
         hs_lastmodifieddate, hubspot_owner_id, hs_timestamp, url, synced_at)
-    VALUES (:email_id, :company_id, :hs_email_subject, :hs_email_text, :hs_createdate,
-        :hs_lastmodifieddate, :hubspot_owner_id, :hs_timestamp, :url, :synced_at)
-    ON CONFLICT(email_id) DO UPDATE SET
-        company_id=excluded.company_id, hs_email_subject=excluded.hs_email_subject,
-        hs_email_text=excluded.hs_email_text, hs_createdate=excluded.hs_createdate,
-        hs_lastmodifieddate=excluded.hs_lastmodifieddate, hubspot_owner_id=excluded.hubspot_owner_id,
-        hs_timestamp=excluded.hs_timestamp, url=excluded.url, synced_at=excluded.synced_at
+    VALUES (%(email_id)s, %(company_id)s, %(hs_email_subject)s, %(hs_email_text)s, %(hs_createdate)s,
+        %(hs_lastmodifieddate)s, %(hubspot_owner_id)s, %(hs_timestamp)s, %(url)s, %(synced_at)s)
+    ON DUPLICATE KEY UPDATE
+        company_id=VALUES(company_id), hs_email_subject=VALUES(hs_email_subject),
+        hs_email_text=VALUES(hs_email_text), hs_createdate=VALUES(hs_createdate),
+        hs_lastmodifieddate=VALUES(hs_lastmodifieddate), hubspot_owner_id=VALUES(hubspot_owner_id),
+        hs_timestamp=VALUES(hs_timestamp), url=VALUES(url), synced_at=VALUES(synced_at)
 """
 
 _CONTACT_UPSERT = """
-    INSERT INTO contacts (contact_id, company_id, firstname, lastname, email,
+    INSERT INTO hs_contacts (contact_id, company_id, firstname, lastname, email,
         createdate, lastmodifieddate, url, synced_at)
-    VALUES (:contact_id, :company_id, :firstname, :lastname, :email,
-        :createdate, :lastmodifieddate, :url, :synced_at)
-    ON CONFLICT(contact_id) DO UPDATE SET
-        company_id=excluded.company_id, firstname=excluded.firstname, lastname=excluded.lastname,
-        email=excluded.email, createdate=excluded.createdate, lastmodifieddate=excluded.lastmodifieddate,
-        url=excluded.url, synced_at=excluded.synced_at
+    VALUES (%(contact_id)s, %(company_id)s, %(firstname)s, %(lastname)s, %(email)s,
+        %(createdate)s, %(lastmodifieddate)s, %(url)s, %(synced_at)s)
+    ON DUPLICATE KEY UPDATE
+        company_id=VALUES(company_id), firstname=VALUES(firstname), lastname=VALUES(lastname),
+        email=VALUES(email), createdate=VALUES(createdate), lastmodifieddate=VALUES(lastmodifieddate),
+        url=VALUES(url), synced_at=VALUES(synced_at)
 """
 
 
@@ -398,7 +137,7 @@ _CONTACT_UPSERT = """
 def upsert_hubspot_data(companies: list[dict], label_map: dict | None = None) -> int:
     """
     Upsert enriched companies into normalized tables.
-    Each company → companies row + N deals rows + M notes rows.
+    Each company → hs_companies row + N hs_deals rows + M hs_notes rows.
     label_map: { stage_id → { stageLabel, pipelineLabel } } — from pipelines API.
     Returns total rows written.
     """
@@ -507,56 +246,68 @@ def upsert_hubspot_data(companies: list[dict], label_map: dict | None = None) ->
                 "synced_at":        now,
             })
 
-    with _lock:
-        conn = _get_conn()
-        with conn:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        try:
             if co_rows:
-                conn.executemany(_COMPANY_UPSERT, co_rows)
+                cur.executemany(_COMPANY_UPSERT, co_rows)
             if deal_rows:
-                conn.executemany(_DEAL_UPSERT, deal_rows)
+                cur.executemany(_DEAL_UPSERT, deal_rows)
             if note_rows:
-                conn.executemany(_NOTE_UPSERT, note_rows)
+                cur.executemany(_NOTE_UPSERT, note_rows)
             if email_rows:
-                conn.executemany(_EMAIL_UPSERT, email_rows)
+                cur.executemany(_EMAIL_UPSERT, email_rows)
             if contact_rows:
-                conn.executemany(_CONTACT_UPSERT, contact_rows)
+                cur.executemany(_CONTACT_UPSERT, contact_rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     return len(co_rows) + len(deal_rows) + len(note_rows) + len(email_rows) + len(contact_rows)
 
 
 def clear_hubspot_data() -> None:
     """Delete all rows from the normalized tables and reset sync/pipeline state."""
-    with _lock:
-        conn = _get_conn()
-        conn.execute("DELETE FROM companies")
-        conn.execute("DELETE FROM deals")
-        conn.execute("DELETE FROM notes")
-        conn.execute("DELETE FROM emails")
-        conn.execute("DELETE FROM contacts")
-        conn.execute("DELETE FROM hs_kv WHERE key = 'hubspot:sync_status'")
-        conn.execute("DELETE FROM hs_kv WHERE key = 'hubspot:pipeline_labels'")
-        conn.commit()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM hs_companies")
+            cur.execute("DELETE FROM hs_deals")
+            cur.execute("DELETE FROM hs_notes")
+            cur.execute("DELETE FROM hs_emails")
+            cur.execute("DELETE FROM hs_contacts")
+            cur.execute("DELETE FROM hs_kv WHERE `key` = 'hubspot:sync_status'")
+            cur.execute("DELETE FROM hs_kv WHERE `key` = 'hubspot:pipeline_labels'")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
 # ─── Read ─────────────────────────────────────────────────────────────────────
 
 def get_hubspot_db_entities() -> dict:
     """Return {companies, deals, notes, emails, contacts} shaped for the frontend
-    (same as enriched API shape). Reads from the read replica — this is purely
-    a frontend-facing GET path, never used by any write flow."""
-    with _replica_lock:
-        conn  = _get_replica_conn()
-        cos   = [dict(r) for r in conn.execute("SELECT * FROM companies ORDER BY name").fetchall()]
-        deals = [dict(r) for r in conn.execute("SELECT * FROM deals ORDER BY dealname").fetchall()]
-        notes = [dict(r) for r in conn.execute(
-            "SELECT * FROM notes ORDER BY hs_createdate DESC"
-        ).fetchall()]
-        emails = [dict(r) for r in conn.execute(
-            "SELECT * FROM emails ORDER BY hs_createdate DESC"
-        ).fetchall()]
-        contacts = [dict(r) for r in conn.execute(
-            "SELECT * FROM contacts ORDER BY lastname"
-        ).fetchall()]
+    (same as enriched API shape). No separate replica to read from on MySQL —
+    reads the primary directly (see mysql_pool.py's module docstring)."""
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM hs_companies ORDER BY name")
+        cos = cur.fetchall()
+        cur.execute("SELECT * FROM hs_deals ORDER BY dealname")
+        deals = cur.fetchall()
+        cur.execute("SELECT * FROM hs_notes ORDER BY hs_createdate DESC")
+        notes = cur.fetchall()
+        cur.execute("SELECT * FROM hs_emails ORDER BY hs_createdate DESC")
+        emails = cur.fetchall()
+        cur.execute("SELECT * FROM hs_contacts ORDER BY lastname")
+        contacts = cur.fetchall()
+        cur.close()
 
     def _co(r):
         return {
@@ -608,53 +359,59 @@ def get_hubspot_flat_data() -> list[dict]:
     lists (cheap — no large text columns).
 
     Does NOT include full note/email bodies for every engagement — the emails
-    table alone holds 100MB+ of text across thousands of rows, and loading all
-    of it on every list request took 1-2s+. Full note/email bodies for one
+    table alone can hold 100MB+ of text across thousands of rows, and loading
+    all of it on every list request is slow. Full note/email bodies for one
     company are fetched on demand via get_hubspot_company_details() when its
-    modal is opened. Reads from the read replica — purely a frontend-facing
-    GET path, never used by any write flow.
+    modal is opened. No separate replica to read from on MySQL — reads the
+    primary directly (see mysql_pool.py's module docstring).
     """
-    with _replica_lock:
-        conn = _get_replica_conn()
-        cos  = [dict(r) for r in conn.execute("SELECT * FROM companies ORDER BY name").fetchall()]
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM hs_companies ORDER BY name")
+        cos = cur.fetchall()
 
         # Id-only scans (no large text columns) — cheap, used for per-company counts.
-        deal_id_rows    = conn.execute("SELECT deal_id, company_id FROM deals").fetchall()
-        note_id_rows    = conn.execute("SELECT note_id, company_id FROM notes").fetchall()
-        email_id_rows   = conn.execute("SELECT email_id, company_id FROM emails").fetchall()
-        contact_id_rows = conn.execute("SELECT contact_id, company_id FROM contacts").fetchall()
+        cur.execute("SELECT deal_id, company_id FROM hs_deals")
+        deal_id_rows = cur.fetchall()
+        cur.execute("SELECT note_id, company_id FROM hs_notes")
+        note_id_rows = cur.fetchall()
+        cur.execute("SELECT email_id, company_id FROM hs_emails")
+        email_id_rows = cur.fetchall()
+        cur.execute("SELECT contact_id, company_id FROM hs_contacts")
+        contact_id_rows = cur.fetchall()
 
-        all_deals    = [dict(r) for r in conn.execute(
-            "SELECT * FROM deals ORDER BY closedate DESC, createdate DESC"
-        ).fetchall()]
-        all_contacts = [dict(r) for r in conn.execute(
-            "SELECT * FROM contacts ORDER BY lastname"
-        ).fetchall()]
+        cur.execute("SELECT * FROM hs_deals ORDER BY closedate DESC, createdate DESC")
+        all_deals = cur.fetchall()
+        cur.execute("SELECT * FROM hs_contacts ORDER BY lastname")
+        all_contacts = cur.fetchall()
 
         # Exactly one (most recent) note/email row per company — ranked on the
         # narrow id+date columns first, then joined back for the winning rows
         # only, so the large hs_note_body/hs_email_text text is read for
         # ~1 row per company instead of every row in the table.
-        primary_notes = [dict(r) for r in conn.execute("""
+        cur.execute("""
             WITH ranked AS (
                 SELECT note_id, ROW_NUMBER() OVER (
                     PARTITION BY company_id ORDER BY hs_createdate DESC
                 ) AS rn
-                FROM notes
+                FROM hs_notes
             )
-            SELECT n.* FROM notes n
+            SELECT n.* FROM hs_notes n
             INNER JOIN ranked r ON r.note_id = n.note_id AND r.rn = 1
-        """).fetchall()]
-        primary_emails = [dict(r) for r in conn.execute("""
+        """)
+        primary_notes = cur.fetchall()
+        cur.execute("""
             WITH ranked AS (
                 SELECT email_id, ROW_NUMBER() OVER (
                     PARTITION BY company_id ORDER BY hs_createdate DESC
                 ) AS rn
-                FROM emails
+                FROM hs_emails
             )
-            SELECT e.* FROM emails e
+            SELECT e.* FROM hs_emails e
             INNER JOIN ranked r ON r.email_id = e.email_id AND r.rn = 1
-        """).fetchall()]
+        """)
+        primary_emails = cur.fetchall()
+        cur.close()
 
     deals_by_co: dict[str, list[dict]] = {}
     for d in all_deals:
@@ -773,16 +530,19 @@ def get_hubspot_company_details(company_id: str) -> dict:
     recent first. Indexed on (company_id, hs_createdate) so this is a narrow
     lookup regardless of how large the notes/emails tables grow — unlike
     get_hubspot_flat_data(), which intentionally omits this per-company detail
-    for every company at once. Reads from the read replica.
+    for every company at once.
     """
-    with _replica_lock:
-        conn = _get_replica_conn()
-        notes = [dict(r) for r in conn.execute(
-            "SELECT * FROM notes WHERE company_id = ? ORDER BY hs_createdate DESC", (company_id,)
-        ).fetchall()]
-        emails = [dict(r) for r in conn.execute(
-            "SELECT * FROM emails WHERE company_id = ? ORDER BY hs_createdate DESC", (company_id,)
-        ).fetchall()]
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT * FROM hs_notes WHERE company_id = %s ORDER BY hs_createdate DESC", (company_id,)
+        )
+        notes = cur.fetchall()
+        cur.execute(
+            "SELECT * FROM hs_emails WHERE company_id = %s ORDER BY hs_createdate DESC", (company_id,)
+        )
+        emails = cur.fetchall()
+        cur.close()
 
     return {
         "all_notes": [
@@ -817,62 +577,95 @@ def backfill_deal_labels(label_map: dict) -> int:
     """
     if not label_map:
         return 0
-    with _lock:
-        conn = _get_conn()
-        rows = conn.execute("SELECT deal_id, dealstage FROM deals").fetchall()
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT deal_id, dealstage FROM hs_deals")
+        rows = cur.fetchall()
         updated = 0
-        for row in rows:
-            lbl = label_map.get(row["dealstage"], {})
-            stage_label = lbl.get("stageLabel", "")
-            pipeline_label = lbl.get("pipelineLabel", "")
-            if stage_label or pipeline_label:
-                conn.execute(
-                    "UPDATE deals SET dealstage_label=?, pipeline_label=? WHERE deal_id=?",
-                    (stage_label, pipeline_label, row["deal_id"]),
-                )
-                updated += 1
-        conn.commit()
+        try:
+            for row in rows:
+                lbl = label_map.get(row["dealstage"], {})
+                stage_label = lbl.get("stageLabel", "")
+                pipeline_label = lbl.get("pipelineLabel", "")
+                if stage_label or pipeline_label:
+                    cur.execute(
+                        "UPDATE hs_deals SET dealstage_label=%s, pipeline_label=%s WHERE deal_id=%s",
+                        (stage_label, pipeline_label, row["deal_id"]),
+                    )
+                    updated += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
     return updated
 
 
 def get_all_company_ids() -> list[str]:
     """Every company_id already saved locally — used by backfill scripts."""
-    with _lock:
-        rows = _get_conn().execute("SELECT company_id FROM companies ORDER BY name").fetchall()
-        return [r["company_id"] for r in rows]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_id FROM hs_companies ORDER BY name")
+        rows = cur.fetchall()
+        cur.close()
+        return [r[0] for r in rows]
 
 
 def get_company_ids_with_emails() -> set[str]:
-    """company_ids that already have at least one row in `emails` — used to skip
+    """company_ids that already have at least one row in hs_emails — used to skip
     already-backfilled companies."""
-    with _lock:
-        rows = _get_conn().execute("SELECT DISTINCT company_id FROM emails").fetchall()
-        return {r["company_id"] for r in rows}
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT company_id FROM hs_emails")
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0] for r in rows}
 
 
 def get_company_count() -> int:
-    with _lock:
-        return _get_conn().execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hs_companies")
+        n = cur.fetchone()[0]
+        cur.close()
+        return n
 
 
 def get_deal_count() -> int:
-    with _lock:
-        return _get_conn().execute("SELECT COUNT(*) FROM deals").fetchone()[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hs_deals")
+        n = cur.fetchone()[0]
+        cur.close()
+        return n
 
 
 def get_note_count() -> int:
-    with _lock:
-        return _get_conn().execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hs_notes")
+        n = cur.fetchone()[0]
+        cur.close()
+        return n
 
 
 def get_email_count() -> int:
-    with _lock:
-        return _get_conn().execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hs_emails")
+        n = cur.fetchone()[0]
+        cur.close()
+        return n
 
 
 def get_contact_count() -> int:
-    with _lock:
-        return _get_conn().execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hs_contacts")
+        n = cur.fetchone()[0]
+        cur.close()
+        return n
 
 
 # ─── Sync status ──────────────────────────────────────────────────────────────

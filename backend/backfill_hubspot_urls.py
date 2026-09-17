@@ -23,7 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.config import HUBSPOT_API_KEY
 from config.logging_config import configure_logging, get_logger
 from apis.hubspot import hubspot_request
-import db.hubspot as hubspot_db
+from db.mysql_pool import get_connection
+
+# Old SQLite table names (notes/emails) -> current MySQL table names (hs_notes/hs_emails)
+_TABLE_NAMES = {"notes": "hs_notes", "emails": "hs_emails"}
 
 configure_logging()
 logger = get_logger("backfill_urls")
@@ -43,16 +46,27 @@ async def _fetch_email(email_id: str) -> dict:
 
 
 def _pending_ids(table: str, id_col: str) -> list[str]:
-    with hubspot_db._lock:
-        rows = hubspot_db._get_conn().execute(f"SELECT {id_col} FROM {table} WHERE url = ''").fetchall()
-        return [r[id_col] for r in rows]
+    mysql_table = _TABLE_NAMES[table]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {id_col} FROM {mysql_table} WHERE url = '' OR url IS NULL")
+        rows = cur.fetchall()
+        cur.close()
+        return [r[0] for r in rows]
 
 
 def _write_url(table: str, id_col: str, obj_id: str, url: str) -> None:
-    with hubspot_db._lock:
-        conn = hubspot_db._get_conn()
-        conn.execute(f"UPDATE {table} SET url = ? WHERE {id_col} = ?", (url, obj_id))
-        conn.commit()
+    mysql_table = _TABLE_NAMES[table]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"UPDATE {mysql_table} SET url = %s WHERE {id_col} = %s", (url, obj_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
 async def _backfill(kind: str, id_col: str, table: str, fetch_fn, ids: list[str], dry_run: bool) -> tuple[int, int]:

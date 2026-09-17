@@ -34,9 +34,8 @@ from config.logging_config import configure_logging, get_logger
 configure_logging()
 logger = get_logger("merlin.main")
 from db.analytical_db import _get_conn as _init_analytical, close_analytical_db
-from db.merlin_db import _get_conn as _init_merlin, close_db
 from db.chat_db import _get_conn as _init_chat, close_chat_db
-from db.hubspot import _get_conn as _init_hubspot, close_hubspot_db
+from db.mysql_pool import init_pool as _init_mysql_pool, close_pool as _close_mysql_pool
 from interface.classes import FinalResponseBody
 from interface.interface import router
 from apis.prompts import FINAL_RESPONSE_SYSTEM_PROMPT
@@ -104,10 +103,9 @@ async def _fireflies_sync_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    _init_merlin()
+    _init_mysql_pool()  # backs merlin_db.py + hubspot.py (glessio_master) — one shared pool
     _init_analytical()
     _init_chat()
-    _init_hubspot()
     logger.info(f"[server] listening on http://localhost:{PORT}")
     hubspot_cron_task = asyncio.create_task(_hubspot_sync_loop())
     fireflies_cron_task = asyncio.create_task(_fireflies_sync_loop())
@@ -119,10 +117,9 @@ async def lifespan(_app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
-    close_db()
+    _close_mysql_pool()
     close_analytical_db()
     close_chat_db()
-    close_hubspot_db()
     await close_hubspot_client()
     logger.info("[server] databases closed")
 

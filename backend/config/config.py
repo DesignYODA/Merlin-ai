@@ -41,3 +41,13 @@ EXCLUDED_HOSTS: list[str] = _parse_list("EXCLUDED_HOSTS")
 EXCLUDED_TITLES: list[str] = _parse_list("EXCLUDED_TITLES")
 INTERNAL_DOMAINS: list[str] = _parse_list("INTERNAL_DOMAINS")
 HIRING_KEYWORDS: list[str] = _parse_list("HIRING_KEYWORDS")
+
+# MySQL — backs merlin_db.py (g_auth, g_sessions, g_fireflies, g_product_insights,
+# fireflies_kv) and hubspot.py (hs_kv, hs_companies, hs_deals, hs_notes, hs_contacts,
+# hs_emails), all in one database. chat_db.py/analytical_db.py stay on SQLite (above).
+MYSQL_HOST: str = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER: str = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE: str = os.getenv("MYSQL_DATABASE", "glessio_master")
+MYSQL_POOL_SIZE: int = int(os.getenv("MYSQL_POOL_SIZE", "10"))
